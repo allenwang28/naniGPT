@@ -9,15 +9,16 @@ from dataclasses import asdict
 
 import torch
 import torch.nn.functional as F
-import wandb
 from torch.utils.data import DataLoader
 
+import wandb
 from nanigpt.data.synthetic import RandomTokenDataset
 from nanigpt.models.dense_transformer import PRESET_CONFIGS, DenseTransformer
 from nanigpt.profiling import flop_counter
-from nanigpt.profiling.context import init_context, step_context
+from nanigpt.profiling.context import init_context, register_step_end, step_context
 from nanigpt.profiling.event_types import EventType
 from nanigpt.profiling.timer import get_global_metrics, measure
+from nanigpt.profiling.torch_profiler import ProfilerConfig, TorchProfiler
 
 # ---- Config ----
 MODEL_PRESET = "small"
@@ -29,6 +30,14 @@ LOG_INTERVAL = 10
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 NUM_WORKERS = 2
+PROFILER_CONFIG = ProfilerConfig(
+    enabled=True,
+    start_step=10,
+    end_step=12,
+    warmup_steps=1,
+    top_n=15,
+    export_trace=True,
+)
 # -----------------------------------
 
 
@@ -59,6 +68,7 @@ def main():
             "num_steps": NUM_STEPS,
             "dtype": str(DTYPE),
             "gpu": gpu_name,
+            "profiler": TorchProfiler(PROFILER_CONFIG).config_dict(),
         },
     )
 
@@ -92,13 +102,14 @@ def main():
 
     step_width = len(str(NUM_STEPS))
     header = (
-        f"{'step':>{step_width * 2 + 1}}    {'loss':>7}  {'ms/step':>7}"
-        f"  {'TFLOPS':>6}   {'MFU':>5}"
+        f"{'step':>{step_width * 2 + 1}}    {'loss':>7}  {'ms/step':>7}  {'TFLOPS':>6}   {'MFU':>5}"
     )
     log.info(header)
 
     model.train()
     data_iter = iter(loader)
+    profiler = TorchProfiler(PROFILER_CONFIG)
+    register_step_end(profiler)
     t0 = time.perf_counter()
 
     for step in range(1, NUM_STEPS + 1):
@@ -167,16 +178,19 @@ def main():
     log.info(f"Mean TFLOPS: {mean_tflops:.1f}")
     log.info(f"Mean MFU: {mean_mfu * 100:.1f}%")
     log.info(f"Peak memory: {peak_mem:.2f} GB")
+    profiler.print_summary()
 
-    wandb.summary.update({
-        "wall_time_s": wall_time,
-        "mean_ms_per_step": mean_total_ms,
-        "mean_tflops": mean_tflops,
-        "mean_mfu": mean_mfu,
-        "peak_memory_gb": peak_mem,
-        "num_params": num_params,
-        "non_emb_params": non_emb_params,
-    })
+    wandb.summary.update(
+        {
+            "wall_time_s": wall_time,
+            "mean_ms_per_step": mean_total_ms,
+            "mean_tflops": mean_tflops,
+            "mean_mfu": mean_mfu,
+            "peak_memory_gb": peak_mem,
+            "num_params": num_params,
+            "non_emb_params": non_emb_params,
+        }
+    )
     wandb.finish()
 
 

@@ -1,16 +1,20 @@
 """PyTorch Profiler integration with terminal-first output and optional wandb trace upload.
 
-This Uses the step-end callback system to drive profiling automatically.
+Provides a callable TorchProfiler that plugs into the step-end callback system.
 
 Usage:
 
-    from nanigpt.profiling.torch_profiler import ProfilerConfig, init_profiler
+    from nanigpt.profiling.context import register_step_end
+    from nanigpt.profiling.torch_profiler import ProfilerConfig, TorchProfiler
 
-    init_profiler(ProfilerConfig(enabled=True, start_step=10, end_step=12))
+    profiler = TorchProfiler(ProfilerConfig(start_step=10, end_step=12))
+    register_step_end(profiler)
 
     for step in range(1, NUM_STEPS + 1):
         with step_context(step):
             ...  # training code
+
+    profiler.print_summary()  # kernel table at end of training
 
 The profiler starts, warms up, records, and cleans up based on step numbers.
 """
@@ -25,7 +29,7 @@ from pathlib import Path
 
 import torch.profiler
 
-from nanigpt.profiling.context import get_step, register_step_end, unregister_step_end
+from nanigpt.profiling.context import get_step, unregister_step_end
 
 log = logging.getLogger(__name__)
 
@@ -139,77 +143,78 @@ def _export_and_upload_wandb_trace(
     thread.start()
 
 
-_pending_results: list[tuple[list, int]] = []
+class TorchProfiler:
+    """Step-end callback that manages the torch profiler lifecycle.
 
+    Callable that conforms to the step-end callback interface. Watches
+    get_step() to enter the profiler at the right time, advance it each step,
+    and tear it down when the window completes.
 
-def print_profiler_summary() -> None:
-    """Print any stashed profiler results. Call at end of training."""
-    for averages, top_n in _pending_results:
-        _print_kernel_table(averages, top_n)
-    _pending_results.clear()
-
-
-def init_profiler(config: ProfilerConfig) -> None:
-    """Register a step-end callback that manages the torch profiler lifecycle.
-
-    The callback watches get_step() and:
-    - Enters the profiler at the right step
-    - Calls profiler.step() each step while active
-    - Tears down and unregisters itself when the window completes
+    Results are stashed and printed via print_summary() at end of training.
     """
-    if not config.enabled:
-        return
 
-    active_steps = config.end_step - config.start_step
+    def __init__(self, config: ProfilerConfig):
+        self._config = config
+        self._results: list[tuple[list, int]] = []
 
-    schedule = torch.profiler.schedule(
-        skip_first=config.start_step - 1,
-        wait=0,
-        warmup=config.warmup_steps,
-        active=active_steps,
-        repeat=1,
-    )
+        if not config.enabled:
+            self._profiler = None
+            self._total_steps = 0
+            return
 
-    # Total steps the torch profiler needs to see before it's done:
-    # skip_first + warmup + active
-    total_profiler_steps = (config.start_step - 1) + config.warmup_steps + active_steps
+        active_steps = config.end_step - config.start_step
 
-    def on_trace_ready(prof: torch.profiler.profile) -> None:
-        _pending_results.append((prof.key_averages(), config.top_n))
-        if config.export_trace:
-            _export_and_upload_wandb_trace(prof, config.start_step, config.end_step)
+        schedule = torch.profiler.schedule(
+            skip_first=config.start_step - 1,
+            wait=0,
+            warmup=config.warmup_steps,
+            active=active_steps,
+            repeat=1,
+        )
 
-    profiler = torch.profiler.profile(
-        schedule=schedule,
-        on_trace_ready=on_trace_ready,
-        record_shapes=config.record_shapes,
-        with_stack=config.with_stack,
-        with_flops=config.with_flops,
-        acc_events=True,
-    )
+        self._total_steps = (config.start_step - 1) + config.warmup_steps + active_steps
+        self._entered = False
+        self._steps_seen = 0
 
-    # Mutable state for the callback
-    state = {"entered": False, "steps_seen": 0}
+        def on_trace_ready(prof: torch.profiler.profile) -> None:
+            self._results.append((prof.key_averages(), config.top_n))
+            if config.export_trace:
+                _export_and_upload_wandb_trace(prof, config.start_step, config.end_step)
 
-    def _step_callback() -> None:
+        self._profiler = torch.profiler.profile(
+            schedule=schedule,
+            on_trace_ready=on_trace_ready,
+            record_shapes=config.record_shapes,
+            with_stack=config.with_stack,
+            with_flops=config.with_flops,
+            acc_events=True,
+        )
+
+    def __call__(self) -> None:
+        if self._profiler is None:
+            return
+
         step = get_step()
         if step is None:
             return
 
-        if not state["entered"]:
-            profiler.__enter__()
-            state["entered"] = True
+        if not self._entered:
+            self._profiler.__enter__()
+            self._entered = True
 
-        profiler.step()
-        state["steps_seen"] += 1
+        self._profiler.step()
+        self._steps_seen += 1
 
-        if state["steps_seen"] >= total_profiler_steps:
-            profiler.__exit__(None, None, None)
-            unregister_step_end(_step_callback)
+        if self._steps_seen >= self._total_steps:
+            self._profiler.__exit__(None, None, None)
+            self._profiler = None
+            unregister_step_end(self)
 
-    register_step_end(_step_callback)
+    def print_summary(self) -> None:
+        """Print the kernel table. Call at end of training."""
+        for averages, top_n in self._results:
+            _print_kernel_table(averages, top_n)
 
-
-def profiler_config_dict(config: ProfilerConfig) -> dict:
-    """Return config as a dict for wandb logging."""
-    return asdict(config)
+    def config_dict(self) -> dict:
+        """Return config as a dict for wandb logging."""
+        return asdict(self._config)

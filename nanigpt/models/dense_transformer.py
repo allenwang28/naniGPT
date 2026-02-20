@@ -85,7 +85,7 @@ def apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     # freqs shape: (1, 1, seq_len, d_head // 2)
     freqs = freqs.unsqueeze(0).unsqueeze(0)
-    x_rotated = x_complex * freqs[:, :, :x_complex.shape[2], :]
+    x_rotated = x_complex * freqs[:, :, : x_complex.shape[2], :]
     return torch.view_as_real(x_rotated).reshape(*x.shape).type_as(x)
 
 
@@ -121,7 +121,9 @@ class MultiHeadAttention(nn.Module):
 
         # F.scaled_dot_product_attention dispatches to Flash Attention when available
         attn_out = F.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             is_causal=True,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
         )
