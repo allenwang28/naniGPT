@@ -14,3 +14,4 @@ class EventType(StrEnum):
     FORWARD = "forward"
     BACKWARD = "backward"
     OPTIMIZER = "optimizer"
+    EVAL = "eval"
