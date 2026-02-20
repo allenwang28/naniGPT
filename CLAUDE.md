@@ -74,3 +74,4 @@ A cross-cutting concern across the entire project: quantify where Rust can reali
 ## Project Conventions
 
 - **Use `uv` for everything.** Package management, running scripts (`uv run python -m nanigpt.train`), adding dependencies (`uv add`), etc. No pip, no conda, no venv manually.
+- **Lint and format with `ruff`.** Run `uv run ruff check .` and `uv run ruff format .` before committing. Config lives in `pyproject.toml`.
