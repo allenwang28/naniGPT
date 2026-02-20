@@ -21,7 +21,7 @@ cleared automatically between steps.
 
 import contextlib
 import dataclasses
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import field
 
 
@@ -32,6 +32,18 @@ class StepContext:
 
 
 GLOBAL_CONTEXT: StepContext | None = None
+
+_STEP_END_CALLBACKS: list[Callable[[], None]] = []
+
+
+def register_step_end(fn: Callable[[], None]) -> None:
+    """Register a callback to run at the end of each step (after StepMetrics.step())."""
+    _STEP_END_CALLBACKS.append(fn)
+
+
+def unregister_step_end(fn: Callable[[], None]) -> None:
+    """Remove a previously registered step-end callback."""
+    _STEP_END_CALLBACKS.remove(fn)
 
 
 def init_context() -> None:
@@ -51,7 +63,10 @@ def step_context(step: int) -> Generator[None]:
     finally:
         # Import here to avoid circular import (timer.py imports context.py)
         from nanigpt.profiling.timer import get_global_metrics
+
         get_global_metrics().step()
+        for cb in _STEP_END_CALLBACKS:
+            cb()
         GLOBAL_CONTEXT.step_tags.clear()
 
 
