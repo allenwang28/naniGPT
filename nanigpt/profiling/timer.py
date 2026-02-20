@@ -158,8 +158,15 @@ class StepMetrics:
         return "\n".join(lines)
 
 
-# Module-level global metrics collector
-GLOBAL_METRICS = StepMetrics()
+_global_metrics: StepMetrics | None = None
+
+
+def get_global_metrics() -> StepMetrics:
+    """Return the global StepMetrics instance, creating it on first access."""
+    global _global_metrics
+    if _global_metrics is None:
+        _global_metrics = StepMetrics()
+    return _global_metrics
 
 
 class measure(ContextDecorator):
@@ -203,7 +210,7 @@ class measure(ContextDecorator):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._timer.record_end()
-        GLOBAL_METRICS.record_pending(self.event_type, self._timer)
+        get_global_metrics().record_pending(self.event_type, self._timer)
 
         step = get_step()
         step_prefix = f"[step {step}] " if step is not None else ""
