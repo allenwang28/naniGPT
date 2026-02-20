@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Exploration of frontier training framework design"
 requires-python = ">=3.10"
 dependencies = [
+    "datasets",
     "numpy",
+    "tiktoken",
     "torch>=2.10",
     "triton>=3.6",
     "wandb",
