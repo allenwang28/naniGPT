@@ -129,11 +129,7 @@ class StepMetrics:
 
     def mean_ms(self) -> dict[str, float]:
         """Return mean timings across all recorded steps."""
-        return {
-            name: sum(times) / len(times)
-            for name, times in self._history.items()
-            if times
-        }
+        return {name: sum(times) / len(times) for name, times in self._history.items() if times}
 
     def report(self, last_n: int = 1) -> str:
         """Format a profiling report for the last N steps."""
