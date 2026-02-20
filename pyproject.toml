@@ -7,6 +7,7 @@ dependencies = [
     "numpy",
     "torch>=2.10",
     "triton>=3.6",
+    "wandb",
 ]
 
 [dependency-groups]

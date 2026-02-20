@@ -5,9 +5,11 @@ Run: uv run python -m nanigpt.train
 
 import logging
 import time
+from dataclasses import asdict
 
 import torch
 import torch.nn.functional as F
+import wandb
 from torch.utils.data import DataLoader
 
 from nanigpt.data.synthetic import RandomTokenDataset
@@ -31,7 +33,6 @@ NUM_WORKERS = 2
 
 
 def main():
-    # logging with dimmed timestamps and lgoging level
     logging.basicConfig(
         level=logging.INFO,
         format="\033[2m%(asctime)s %(levelname)s\033[0m %(message)s",
@@ -45,11 +46,26 @@ def main():
     config = PRESET_CONFIGS[MODEL_PRESET]
     config.max_seq_len = SEQ_LEN
 
+    gpu_name = flop_counter.detect_gpu()
+
+    wandb.init(
+        project="nanigpt",
+        config={
+            "model_preset": MODEL_PRESET,
+            "model": asdict(config),
+            "batch_size": BATCH_SIZE,
+            "seq_len": SEQ_LEN,
+            "lr": LR,
+            "num_steps": NUM_STEPS,
+            "dtype": str(DTYPE),
+            "gpu": gpu_name,
+        },
+    )
+
     model = DenseTransformer(config).to(DEVICE)
     num_params = sum(p.numel() for p in model.parameters())
     non_emb_params = model.num_non_embedding_params()
-    log.info("Model: %s | %s params (%s non-embedding)", MODEL_PRESET,
-             f"{num_params:,}", f"{non_emb_params:,}")
+    log.info(f"Model: {MODEL_PRESET} | {num_params:,} params ({non_emb_params:,} non-embedding)")
 
     dataset = RandomTokenDataset(
         vocab_size=config.vocab_size,
@@ -67,17 +83,18 @@ def main():
     )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-    gpu_name = flop_counter.detect_gpu()
     step_flops = flop_counter.total_flops(model, BATCH_SIZE, SEQ_LEN)
 
-    log.info("GPU: %s | Peak: %s TFLOPS (bf16)",
-             gpu_name, flop_counter.GPU_PEAK_TFLOPS.get(gpu_name, "?"))
-    log.info("Batch: %d x %d tokens | Steps: %d", BATCH_SIZE, SEQ_LEN, NUM_STEPS)
-    log.info("Theoretical FLOPs/step: %.2f GFLOPs", step_flops / 1e9)
+    peak = flop_counter.GPU_PEAK_TFLOPS.get(gpu_name, "?")
+    log.info(f"GPU: {gpu_name} | Peak: {peak} TFLOPS (bf16)")
+    log.info(f"Batch: {BATCH_SIZE} x {SEQ_LEN} tokens | Steps: {NUM_STEPS}")
+    log.info(f"Theoretical FLOPs/step: {step_flops / 1e9:.2f} GFLOPs")
 
     step_width = len(str(NUM_STEPS))
-    header = (f"{'step':>{step_width * 2 + 1}}    {'loss':>7}  {'ms/step':>7}  {'TFLOPS':>6}   "
-              f"{'MFU':>5}")
+    header = (
+        f"{'step':>{step_width * 2 + 1}}    {'loss':>7}  {'ms/step':>7}"
+        f"  {'TFLOPS':>6}   {'MFU':>5}"
+    )
     log.info(header)
 
     model.train()
@@ -111,15 +128,26 @@ def main():
             with measure(EventType.OPTIMIZER):
                 optimizer.step()
 
+        timings = get_global_metrics().last_step_ms()
+        total_ms = sum(timings.values())
+        tflops = flop_counter.achieved_tflops(step_flops, total_ms)
+        utilization = flop_counter.mfu(tflops, gpu_name)
+
+        wandb.log(
+            {
+                "loss": loss.item(),
+                "ms_per_step": total_ms,
+                "tflops": tflops,
+                "mfu": utilization,
+                **{f"time/{k}": v for k, v in timings.items()},
+            },
+            step=step,
+        )
+
         if step % LOG_INTERVAL == 0 or step == 1:
-            timings = get_global_metrics().last_step_ms()
-            total_ms = sum(timings.values())
-            tflops = flop_counter.achieved_tflops(step_flops, total_ms)
-            utilization = flop_counter.mfu(tflops, gpu_name)
             log.info(
-                "%*d/%d  %7.2f  %7.1f  %6.1f  %5.1f%%",
-                step_width, step, NUM_STEPS,
-                loss.item(), total_ms, tflops, utilization * 100,
+                f"{step:>{step_width}}/{NUM_STEPS}  {loss.item():7.2f}  {total_ms:7.1f}"
+                f"  {tflops:6.1f}  {utilization * 100:5.1f}%"
             )
 
     # ---- End of training summary ----
@@ -131,14 +159,25 @@ def main():
     mean_mfu = flop_counter.mfu(mean_tflops, gpu_name)
 
     log.info("--- Training complete ---")
-    log.info("Wall time: %.1fs (%d steps)", wall_time, NUM_STEPS)
-    log.info("Mean step: %.1f ms", mean_total_ms)
+    log.info(f"Wall time: {wall_time:.1f}s ({NUM_STEPS} steps)")
+    log.info(f"Mean step: {mean_total_ms:.1f} ms")
     for name, ms in mean_timings.items():
         pct = 100.0 * ms / mean_total_ms if mean_total_ms > 0 else 0.0
-        log.info("  %12s: %7.2f ms (%5.1f%%)", name, ms, pct)
-    log.info("Mean TFLOPS: %.1f", mean_tflops)
-    log.info("Mean MFU: %.1f%%", mean_mfu * 100)
-    log.info("Peak memory: %.2f GB", peak_mem)
+        log.info(f"  {name:>12s}: {ms:7.2f} ms ({pct:5.1f}%)")
+    log.info(f"Mean TFLOPS: {mean_tflops:.1f}")
+    log.info(f"Mean MFU: {mean_mfu * 100:.1f}%")
+    log.info(f"Peak memory: {peak_mem:.2f} GB")
+
+    wandb.summary.update({
+        "wall_time_s": wall_time,
+        "mean_ms_per_step": mean_total_ms,
+        "mean_tflops": mean_tflops,
+        "mean_mfu": mean_mfu,
+        "peak_memory_gb": peak_mem,
+        "num_params": num_params,
+        "non_emb_params": non_emb_params,
+    })
+    wandb.finish()
 
 
 if __name__ == "__main__":

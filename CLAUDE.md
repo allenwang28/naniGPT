@@ -75,3 +75,4 @@ A cross-cutting concern across the entire project: quantify where Rust can reali
 
 - **Use `uv` for everything.** Package management, running scripts (`uv run python -m nanigpt.train`), adding dependencies (`uv add`), etc. No pip, no conda, no venv manually.
 - **Lint and format with `ruff`.** Run `uv run ruff check .` and `uv run ruff format .` before committing. Config lives in `pyproject.toml`.
+- **Use f-strings for formatting.** Prefer `f"step {step}"` over `"step %d" % step` or `"step {}".format(step)`. This applies everywhere including `logging` calls — use `log.info(f"step {step}")` not `log.info("step %d", step)`.

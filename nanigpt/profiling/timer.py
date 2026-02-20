@@ -202,9 +202,7 @@ class measure(ContextDecorator):
         self._timer = CUDATimer(stream=self._stream)
         step = get_step()
         step_prefix = f"[step {step}] " if step is not None else ""
-        logger.debug(
-            "%s%s %s_start", step_prefix, self.description, self.event_type.value
-        )
+        logger.debug(f"{step_prefix}{self.description} {self.event_type.value}_start")
         self._timer.record_start()
         return self
 
@@ -214,7 +212,5 @@ class measure(ContextDecorator):
 
         step = get_step()
         step_prefix = f"[step {step}] " if step is not None else ""
-        logger.debug(
-            "%s%s %s_end", step_prefix, self.description, self.event_type.value
-        )
+        logger.debug(f"{step_prefix}{self.description} {self.event_type.value}_end")
         return False
