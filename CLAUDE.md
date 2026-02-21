@@ -83,6 +83,8 @@ A cross-cutting concern across the entire project: quantify where Rust can reali
 - Things that surprised you or broke your mental model
 - Dead ends worth remembering so you don't revisit them
 
+**Show the code.** Err on the side of including code snippets — inline fenced blocks that demonstrate the pattern or API being discussed. Claims about how a framework works are more convincing (and more useful to future-you) when backed by the actual code. A 5-10 line snippet is worth more than a paragraph of description. Each snippet should be preceded by a commit-pinned GitHub link to the source file and line range (following the citation convention below), so the reader can see the full context.
+
 **What doesn't go here:**
 - API docs or usage instructions (those belong in docstrings or README)
 - TODO lists or project management (use issues/tasks for that)
