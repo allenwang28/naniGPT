@@ -71,6 +71,24 @@ A cross-cutting concern across the entire project: quantify where Rust can reali
 - General-purpose distributed training library
 - Pipeline parallelism (least transferable parallelism strategy)
 
+## Journal
+
+`journal/` contains dated markdown entries that document design decisions, research findings, benchmark results, and lessons learned as the project evolves.
+
+**Format:** `YYYY-MM-DD-topic-name.md` — flat directory, no subdirectories. Dates provide natural ordering.
+
+**What goes here:**
+- Design explorations and tradeoff analysis (e.g. comparing config systems before choosing one)
+- Benchmark results and performance comparisons, with actual numbers and tables
+- Things that surprised you or broke your mental model
+- Dead ends worth remembering so you don't revisit them
+
+**What doesn't go here:**
+- API docs or usage instructions (those belong in docstrings or README)
+- TODO lists or project management (use issues/tasks for that)
+
+Entries can be revisited and updated — add a dated addendum rather than rewriting history.
+
 ## Project Conventions
 
 - **Use `uv` for everything.** Package management, running scripts (`uv run python -m nanigpt.train`), adding dependencies (`uv add`), etc. No pip, no conda, no venv manually.
