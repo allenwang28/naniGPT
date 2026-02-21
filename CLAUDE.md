@@ -89,6 +89,8 @@ A cross-cutting concern across the entire project: quantify where Rust can reali
 
 Entries can be revisited and updated — add a dated addendum rather than rewriting history.
 
+**Citing external code:** When referencing code in other frameworks, link to the specific file on GitHub pinned to the commit hash we're working from (not `main`, which drifts). Use the format `https://github.com/org/repo/blob/<commit_hash>/path/to/file.py#L42-L60`. No links for internal/non-open-source codebases.
+
 ## Project Conventions
 
 - **Use `uv` for everything.** Package management, running scripts (`uv run python -m nanigpt.train`), adding dependencies (`uv add`), etc. No pip, no conda, no venv manually.
