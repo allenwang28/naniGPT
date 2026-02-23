@@ -5,7 +5,7 @@
 
 When you're spending millions of dollars on a training run, the question isn't just "how fast
 are my GPUs" -- it's "how much of that speed actually turns into trained model." The gap
-between theoretical peak and realized progress is where "goodput"" lives.
+between theoretical peak and realized progress is where "goodput" lives.
 
 Google published a useful decomposition of [goodput](https://cloud.google.com/blog/products/ai-machine-learning/goodput-metric-as-measure-of-ml-productivity):
 
@@ -156,7 +156,7 @@ significantly -- elastic data parallelism, orchestration-level recovery, and
 single-controller architectures -- but they all start from this same arithmetic.
 The rest of this entry compares them.
 
-(See Appendix B for a more complete survey of publicly reported failure rates.)
+(See the appendix for a more complete survey of publicly reported failure rates.)
 
 
 ## 3. Detection: how do you know something broke?
@@ -660,12 +660,13 @@ effective training time -- nearly double the 44% from checkpoint-restart.
 **Zero-gradient catch-up.** The recovering replica needs to synchronize with
 the rest of the group. The mechanism is elegant: during the first step after
 rejoining, the recovering replica participates in the allreduce but contributes
-zero gradients. The gradient average is divided only by the number of
-contributing replicas, so the result is mathematically identical to running a
-step with N-1 replicas. Meanwhile, the recovering replica asynchronously fetches
+zero gradients. The allreduce averages across all replicas including the
+recovering one, effectively diluting the gradient by a factor of
+`(R-1)/R` -- equivalent to a smaller effective batch for that step.
+Meanwhile, the recovering replica asynchronously fetches
 a checkpoint from a healthy peer via HTTP. After one step, it has the checkpoint
-loaded and is fully synchronized -- no approximations, no gradient staleness, no
-impact on convergence.
+loaded and is fully synchronized -- no gradient staleness, no state divergence.
+Section 6 discusses the convergence implications of this transient dilution.
 
 **FTAR.** Meta's **F**ault-**T**olerant **A**ll**R**educe splits the responsibility between CPU
 and GPU. The CPU drives the control plane: connection management, peer
@@ -1343,7 +1344,7 @@ the parameter memory), gradient state, and dataloader state. ByteDance
 [reports](https://www.usenix.org/system/files/nsdi25-wan-borui.pdf) that the
 average end-to-end time to save a GPT 175B model checkpoint to HDFS on 4,096
 GPUs is 200 seconds (ByteCheckpoint, Section 2.3). Meanwhile, section 2
-established that Meta projects MTBF as low as 14 minutes at 131K GPUs, and
+established that Meta observes an MTBF of just 18 minutes at 100K GPUs, and
 ByteDance reports failures once every 45 minutes in large-scale training. When
 your checkpoint takes a meaningful fraction of your MTBF, the math works
 against you.
@@ -1735,7 +1736,8 @@ the [linear scaling rule](https://arxiv.org/abs/1706.02677) (Goyal et al.,
 expected weight update magnitude.
 
 **Square root scaling.** Scale the learning rate by `sqrt(healthy / total)`.
-The theoretical argument: gradient noise variance scales linearly with the
+The intuition (not derived in the FT-HSDP paper, but standard gradient noise
+reasoning): gradient noise variance scales linearly with the
 inverse of batch size (each sample contributes independent noise), so the
 standard deviation scales with `1 / sqrt(B)`. If you want to maintain the
 signal-to-noise ratio of the gradient update -- the ratio of the expected
@@ -1744,8 +1746,9 @@ proportionally to `sqrt(B)`, not `B`. When the batch shrinks, `sqrt` scaling
 reduces the learning rate less aggressively than linear scaling, reflecting
 that the signal degrades more slowly than the linear scaling rule assumes.
 
-FT-HSDP finds that sqrt scaling performs better than linear, and both perform
-better than no intervention. The practical benefit of sqrt scaling: it
+FT-HSDP finds that sqrt scaling performs better than linear (to the extent
+that the paper drops linear results entirely). The practical benefit of sqrt
+scaling: it
 flattens the loss fluctuation during failure periods, which helps with
 debugging (a sudden spike is harder to diagnose than a gentle drift).
 
@@ -1838,11 +1841,7 @@ initiate the checkpoint. If no failure occurs, productive time is
 distributed within the interval), you lose on average `N_ckpt * T_iter / 2`
 of training plus `T_cold` for recovery.
 
-The expected productive work per unit wall time:
-
-    goodput_sync = (N_ckpt * T_iter) / (N_ckpt * T_iter + T_s + (N_ckpt * T_iter / 2 + T_cold) / (MTBF / (N_ckpt * T_iter + T_s)))
-
-This simplifies. Let `C = N_ckpt * T_iter + T_s` be the wall time of one
+Let `C = N_ckpt * T_iter + T_s` be the wall time of one
 checkpoint interval. The expected number of failures per interval is
 `C / MTBF` (for `C << MTBF`, at most one failure per interval). The expected
 wasted time per interval is then:
@@ -1882,13 +1881,13 @@ But the impact is different. A replica failure causes `T_elastic` seconds of
 degraded operation (at `(R-1)/R` throughput), not a full-cluster restart.
 The throughput loss per failure event is:
 
-    lost_throughput_per_failure = (1/R) * T_elastic * T_iter
+    lost_throughput_per_failure = (1/R) * T_elastic
 
 The steady-state goodput:
 
     goodput_elastic = 1 - T_s / (N_ckpt * T_iter)          # checkpoint overhead
                         - T_elastic / (R * MTBF_cluster)    # degraded operation fraction
-                        - (N_ckpt * T_iter / 2 + T_cold) * P_correlated / (N_ckpt * T_iter)
+                        - P_correlated * (N_ckpt * T_iter / 2 + T_cold) / MTBF_cluster
 
 The first term is the same checkpoint stall overhead. The second term is the
 fraction of time spent in degraded mode -- each failure degrades throughput by
@@ -1910,7 +1909,12 @@ The synchronous paradigm pays `(N_ckpt * T_iter / 2 + T_cold) / MTBF` per
 failure. The elastic paradigm pays `T_elastic / (R * MTBF)`. Elastic wins
 when:
 
-    T_elastic / R  <  N_ckpt * T_iter / 2 + T_cold
+    T_elastic / R  <  (1 - P_correlated) * (N_ckpt * T_iter / 2 + T_cold)
+
+(The `1 - P_correlated` factor accounts for the fact that elastic systems still
+pay the full restart penalty on correlated failures. For small `P_correlated`
+this is close to 1 and the condition simplifies to
+`T_elastic / R < N_ckpt * T_iter / 2 + T_cold`.)
 
 With FT-HSDP's numbers from section 4 (`T_elastic ≈ 180s` at 98K GPUs,
 including 3 minutes of reduced stall vs 10 minutes synchronous) and typical
@@ -1927,110 +1931,18 @@ a few hours.
 
 ### Plotting it
 
-The model is simple enough to compute numerically. The script below uses
-parameters drawn from sections 2, 4, and 5:
-
-```python
-# journal/2026-02-21-fault-tolerance-goodput-model.py
-"""
-Goodput vs GPU count for synchronous vs elastic fault tolerance.
-Parameters drawn from FT-HSDP (arXiv 2602.00277) and ByteCheckpoint (NSDI '25).
-"""
-
-import matplotlib.pyplot as plt
-import numpy as np
-
-# --- Parameters ---
-# Per-server failure rate: 0.0023 failures/server/day (Meta, section 2)
-# 8 GPUs per server
-LAMBDA_PER_GPU = 0.0023 / 8 / 86400  # failures/GPU/second
-
-T_ITER = 2.0          # seconds per training step
-T_STALL = 0.5         # checkpoint stall (ByteCheckpoint steady-state)
-T_SAVE = 40.0         # end-to-end save (background, overlapped)
-T_LOAD = 150.0        # checkpoint load time
-
-# Cold recovery: fit from Meta's Figure 2 (section 2)
-# ~200s at 16K, ~600s at 64K, ~900s at 98K
-def t_cold(n_gpus):
-    return 50 + 0.009 * n_gpus  # rough linear fit in seconds
-
-# Elastic recovery (FT-HSDP): ~180s at 98K GPUs
-T_ELASTIC = 180.0
-
-# Correlated failure probability: fraction of failures that take down
-# the whole job even with elastic recovery
-P_CORRELATED = 0.05
-
-# --- GPU counts to sweep ---
-gpu_counts = np.logspace(np.log10(1000), np.log10(200_000), 200)
-
-def mtbf(n_gpus):
-    """Cluster MTBF in seconds. Uses empirical superlinear correction."""
-    # Linear: MTBF = 1 / (N * lambda)
-    mtbf_linear = 1.0 / (n_gpus * LAMBDA_PER_GPU)
-    # Superlinear correction: Meta observed 18 min at 100K vs 50 min linear
-    # Apply a mild power-law correction: MTBF_actual = MTBF_linear * (N_ref/N)^0.3
-    n_ref = 32_000
-    correction = (n_ref / n_gpus) ** 0.3 if n_gpus > n_ref else 1.0
-    return mtbf_linear * correction
-
-def optimal_ckpt_interval(mtbf_s, t_stall):
-    """Young's formula: optimal interval in seconds."""
-    return np.sqrt(2 * mtbf_s * t_stall)
-
-def goodput_sync(n_gpus):
-    m = mtbf(n_gpus)
-    ckpt_interval = optimal_ckpt_interval(m, T_STALL)
-    n_steps = ckpt_interval / T_ITER
-    cycle = n_steps * T_ITER + T_STALL
-    # Expected wasted time per cycle
-    t_wasted = (cycle / m) * (n_steps * T_ITER / 2 + t_cold(n_gpus))
-    productive = n_steps * T_ITER - t_wasted
-    return max(0, productive / cycle)
-
-def goodput_elastic(n_gpus, n_replicas):
-    m = mtbf(n_gpus)
-    ckpt_interval = optimal_ckpt_interval(m, T_STALL)
-    n_steps = ckpt_interval / T_ITER
-    cycle = n_steps * T_ITER + T_STALL
-    # Checkpoint overhead
-    ckpt_overhead = T_STALL / cycle
-    # Degraded operation fraction
-    degraded_frac = T_ELASTIC / (n_replicas * m)
-    # Correlated failure penalty (still need full restart)
-    correlated_penalty = P_CORRELATED * (n_steps * T_ITER / 2 + t_cold(n_gpus)) / m
-    return max(0, 1.0 - ckpt_overhead - degraded_frac - correlated_penalty)
-
-# --- Compute ---
-gp_sync = [goodput_sync(n) for n in gpu_counts]
-gp_elastic_4 = [goodput_elastic(n, 4) for n in gpu_counts]
-gp_elastic_8 = [goodput_elastic(n, 8) for n in gpu_counts]
-gp_elastic_16 = [goodput_elastic(n, 16) for n in gpu_counts]
-
-# --- Plot ---
-fig, ax = plt.subplots(figsize=(10, 6))
-ax.plot(gpu_counts / 1000, gp_sync, label="Synchronous checkpoint-restart", linewidth=2)
-ax.plot(gpu_counts / 1000, gp_elastic_4, label="Elastic (R=4 replicas)", linewidth=2)
-ax.plot(gpu_counts / 1000, gp_elastic_8, label="Elastic (R=8 replicas)", linewidth=2)
-ax.plot(gpu_counts / 1000, gp_elastic_16, label="Elastic (R=16 replicas)", linewidth=2)
-
-ax.set_xlabel("GPU count (thousands)", fontsize=12)
-ax.set_ylabel("Goodput (fraction of wall time)", fontsize=12)
-ax.set_title("Goodput vs scale: synchronous vs elastic fault tolerance", fontsize=14)
-ax.set_xscale("log")
-ax.set_xlim(1, 200)
-ax.set_ylim(0, 1.05)
-ax.legend(fontsize=11)
-ax.grid(True, alpha=0.3)
-ax.axhline(y=0.9, color="gray", linestyle="--", alpha=0.5, label="_nolegend_")
-ax.text(150, 0.91, "90% goodput", fontsize=9, color="gray", ha="right")
-
-plt.tight_layout()
-plt.savefig("journal/2026-02-21-fault-tolerance-goodput-vs-scale.png", dpi=150)
-print("Saved to journal/2026-02-21-fault-tolerance-goodput-vs-scale.png")
-plt.close()
-```
+The model is simple enough to compute numerically. The script
+`journal/2026-02-21-fault-tolerance-goodput-model.py` sweeps GPU count from
+1K to 200K and plots goodput for synchronous checkpoint-restart vs elastic
+with R=4, 8, and 16 replicas. Parameters are drawn from sections 2, 4, and 5:
+Meta's per-server failure rate (0.0023/server/day), cold recovery times fit
+from Meta's Figure 2, ByteCheckpoint's 0.5s steady-state stall, and
+FT-HSDP's 180s elastic recovery time. Note that the model uses cold
+recovery times (~15 min at 98K GPUs), which are more pessimistic than the warm
+recovery (~10 min) used in section 2's simple 44% estimate. At 100K GPUs, cold
+recovery time exceeds the MTBF, making synchronous training essentially
+unviable -- this is the correct conclusion for clusters without pre-allocated
+standbys.
 
 The model makes several simplifications worth noting. It assumes at most one
 failure per checkpoint interval (valid when `C << MTBF`), which breaks down

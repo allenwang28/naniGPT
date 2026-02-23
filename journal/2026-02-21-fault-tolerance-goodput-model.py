@@ -36,9 +36,9 @@ def mtbf(n_gpus):
     # Linear: MTBF = 1 / (N * lambda)
     mtbf_linear = 1.0 / (n_gpus * LAMBDA_PER_GPU)
     # Superlinear correction: Meta observed 18 min at 100K vs 50 min linear
-    # Apply a mild power-law correction: MTBF_actual = MTBF_linear * (N_ref/N)^0.3
+    # Power-law correction calibrated to empirical data: MTBF_actual = MTBF_linear * (N_ref/N)^0.9
     n_ref = 32_000
-    correction = (n_ref / n_gpus) ** 0.3 if n_gpus > n_ref else 1.0
+    correction = (n_ref / n_gpus) ** 0.9 if n_gpus > n_ref else 1.0
     return mtbf_linear * correction
 
 def optimal_ckpt_interval(mtbf_s, t_stall):
