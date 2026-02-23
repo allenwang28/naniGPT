@@ -1931,7 +1931,7 @@ The model is simple enough to compute numerically. The script below uses
 parameters drawn from sections 2, 4, and 5:
 
 ```python
-# journal/goodput_model.py
+# journal/2026-02-21-fault-tolerance-goodput-model.py
 """
 Goodput vs GPU count for synchronous vs elastic fault tolerance.
 Parameters drawn from FT-HSDP (arXiv 2602.00277) and ByteCheckpoint (NSDI '25).
@@ -2027,8 +2027,8 @@ ax.axhline(y=0.9, color="gray", linestyle="--", alpha=0.5, label="_nolegend_")
 ax.text(150, 0.91, "90% goodput", fontsize=9, color="gray", ha="right")
 
 plt.tight_layout()
-plt.savefig("journal/goodput_vs_scale.png", dpi=150)
-print("Saved to journal/goodput_vs_scale.png")
+plt.savefig("journal/2026-02-21-fault-tolerance-goodput-vs-scale.png", dpi=150)
+print("Saved to journal/2026-02-21-fault-tolerance-goodput-vs-scale.png")
 plt.close()
 ```
 
@@ -2046,7 +2046,7 @@ section 6 showed doesn't hurt convergence). The crossover where elastic
 meaningfully outperforms synchronous is around 10-20K GPUs -- below that,
 failures are rare enough that either paradigm works fine.
 
-![Goodput vs scale](goodput_vs_scale.png)
+![Goodput vs scale](2026-02-21-fault-tolerance-goodput-vs-scale.png)
 
 
 ## 8. What's next
