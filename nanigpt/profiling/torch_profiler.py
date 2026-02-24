@@ -5,9 +5,9 @@ Provides a callable TorchProfiler that plugs into the step-end callback system.
 Usage:
 
     from nanigpt.profiling.context import register_step_end
-    from nanigpt.profiling.torch_profiler import ProfilerConfig, TorchProfiler
+    from nanigpt.profiling.torch_profiler import TorchProfiler
 
-    profiler = TorchProfiler(ProfilerConfig(start_step=10, end_step=12))
+    profiler = TorchProfiler(TorchProfiler.Config(start_step=10, end_step=12))
     register_step_end(profiler)
 
     for step in range(1, NUM_STEPS + 1):
@@ -29,24 +29,10 @@ from pathlib import Path
 
 import torch.profiler
 
+from nanigpt.configurable import Configurable
 from nanigpt.profiling.context import get_step, unregister_step_end
 
 log = logging.getLogger(__name__)
-
-
-@dataclass
-class ProfilerConfig:
-    """Controls the PyTorch profiler window."""
-
-    enabled: bool = True
-    start_step: int = 10
-    end_step: int = 12
-    warmup_steps: int = 1
-    top_n: int = 15
-    export_trace: bool = True
-    record_shapes: bool = True
-    with_stack: bool = False
-    with_flops: bool = True
 
 
 def _print_kernel_table(averages: list, top_n: int) -> None:
@@ -143,7 +129,7 @@ def _export_and_upload_wandb_trace(
     thread.start()
 
 
-class TorchProfiler:
+class TorchProfiler(Configurable):
     """Step-end callback that manages the torch profiler lifecycle.
 
     Callable that conforms to the step-end callback interface. Watches
@@ -153,7 +139,27 @@ class TorchProfiler:
     Results are stashed and printed via print_summary() at end of training.
     """
 
-    def __init__(self, config: ProfilerConfig):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        """Controls the PyTorch profiler window."""
+
+        enabled: bool = True
+        start_step: int = 10
+        end_step: int = 12
+        warmup_steps: int = 1
+        top_n: int = 15
+        export_trace: bool = True
+        record_shapes: bool = True
+        with_stack: bool = False
+        with_flops: bool = True
+
+        def __post_init__(self):
+            if self.end_step <= self.start_step:
+                raise ValueError(
+                    f"end_step ({self.end_step}) must be > start_step ({self.start_step})"
+                )
+
+    def __init__(self, config: Config):
         self._config = config
         self._results: list[tuple[list, int]] = []
 
