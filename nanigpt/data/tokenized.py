@@ -2,13 +2,48 @@
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from nanigpt.configurable import Configurable
+
 log = logging.getLogger("tokenized")
+
+
+class TokenizedData(Configurable):
+    """Pre-tokenized memmap data produced by prepare.py."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        data_dir: str = "data/fineweb-1M"
+        """Path to directory containing {split}.bin and meta.json."""
+
+        seq_len: int = 256
+        """Sequence length (tokens per sample)."""
+
+        num_workers: int = 2
+        """DataLoader worker processes."""
+
+        def __post_init__(self):
+            if self.seq_len <= 0:
+                raise ValueError(f"seq_len must be positive, got {self.seq_len}")
+            if not self.data_dir:
+                raise ValueError("data_dir must be non-empty for TokenizedData.Config")
+            if self.num_workers < 0:
+                raise ValueError(f"num_workers must be non-negative, got {self.num_workers}")
+
+    def __init__(self, config: Config, *, split: str, num_samples: int):
+        self.dataset = TokenizedDataset(
+            config.data_dir,
+            split,
+            config.seq_len,
+            num_samples,
+        )
+        self.num_workers = config.num_workers
 
 
 class TokenizedDataset(Dataset):

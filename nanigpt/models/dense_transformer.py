@@ -18,8 +18,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-@dataclass
+@dataclass(kw_only=True, slots=True)
 class TransformerConfig:
+    """Dense transformer architecture parameters."""
+
     vocab_size: int = 50257
     d_model: int = 768
     n_heads: int = 12
@@ -28,10 +30,18 @@ class TransformerConfig:
     max_seq_len: int = 1024
     dropout: float = 0.0
 
+    def __post_init__(self):
+        if self.d_model % self.n_heads != 0:
+            raise ValueError(
+                f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
+            )
+        if self.d_ff <= 0 or self.d_model <= 0:
+            raise ValueError("d_ff and d_model must be positive")
+
 
 # Vocab size 50257 matches GPT-2's BPE tokenizer (50k merges + 256 bytes + 1 EOT).
 # Model dimensions are scaled-down variants of GPT-2.
-PRESET_CONFIGS = {
+MODEL_PRESETS: dict[str, TransformerConfig] = {
     "small": TransformerConfig(
         vocab_size=50257,
         d_model=256,

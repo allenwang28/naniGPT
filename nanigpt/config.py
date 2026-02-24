@@ -1,0 +1,137 @@
+"""Root configuration for training runs.
+
+Defines the config tree (TrainConfig and its sub-configs), the DataConfig
+type alias, and parse_config() for CLI parsing via tyro.
+"""
+
+import sys
+from dataclasses import dataclass, field
+from typing import Annotated, Literal
+
+import torch
+import tyro
+
+from nanigpt.data.synthetic import SyntheticData
+from nanigpt.data.tokenized import TokenizedData
+from nanigpt.models.dense_transformer import TransformerConfig
+from nanigpt.profiling.torch_profiler import TorchProfiler
+
+DataConfig = (
+    Annotated[SyntheticData.Config, tyro.conf.subcommand(name="synthetic")]
+    | Annotated[TokenizedData.Config, tyro.conf.subcommand(name="tokenized")]
+)
+
+
+@dataclass(kw_only=True, slots=True)
+class TrainingConfig:
+    """Training loop hyperparameters."""
+
+    batch_size: int = 32
+    lr: float = 3e-4
+    num_steps: int = 200
+    device: str = "cuda"
+    dtype: Literal["float32", "float16", "bfloat16"] = "bfloat16"
+    seed: int = 42
+
+    @property
+    def torch_dtype(self) -> torch.dtype:
+        return {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[
+            self.dtype
+        ]
+
+    def __post_init__(self):
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {self.num_steps}")
+        if self.lr <= 0:
+            raise ValueError(f"lr must be positive, got {self.lr}")
+
+
+@dataclass(kw_only=True, slots=True)
+class EvalConfig:
+    """Validation evaluation settings."""
+
+    val_interval: int = 50
+    """Evaluate every N training steps."""
+
+    val_steps: int = 20
+    """Number of batches to average for validation loss."""
+
+    def __post_init__(self):
+        if self.val_interval <= 0:
+            raise ValueError(f"val_interval must be positive, got {self.val_interval}")
+        if self.val_steps <= 0:
+            raise ValueError(f"val_steps must be positive, got {self.val_steps}")
+
+
+@dataclass(kw_only=True, slots=True)
+class LoggingConfig:
+    """Logging and experiment tracking."""
+
+    log_interval: int = 10
+    """Print training metrics every N steps."""
+
+    wandb_project: str = "nanigpt"
+    """Weights & Biases project name."""
+
+    def __post_init__(self):
+        if self.log_interval <= 0:
+            raise ValueError(f"log_interval must be positive, got {self.log_interval}")
+
+
+@dataclass(kw_only=True, slots=True)
+class TrainConfig:
+    """Root configuration for a training run."""
+
+    model: TransformerConfig = field(default_factory=TransformerConfig)
+    data: DataConfig = field(default_factory=SyntheticData.Config)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    profiler: TorchProfiler.Config = field(default_factory=TorchProfiler.Config)
+
+
+def parse_config(args: list[str] | None = None) -> TrainConfig:
+    """Parse config from CLI args.
+
+    Usage:
+        # Use a registry preset:
+        python -m nanigpt.train --config small-fineweb
+
+        # Override specific fields:
+        python -m nanigpt.train --config small-fineweb --training.lr 1e-4
+
+        # No preset — all defaults, override what you want:
+        python -m nanigpt.train --training.num-steps 500 --model.d-model 512
+    """
+    import tyro
+
+    if args is None:
+        args = sys.argv[1:]
+
+    # Extract --config if present (handled before tyro sees the args)
+    config_name = None
+    remaining = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--config" and i + 1 < len(args):
+            config_name = args[i + 1]
+            i += 2
+        else:
+            remaining.append(args[i])
+            i += 1
+
+    # Load base config from registry or use defaults
+    if config_name is not None:
+        from nanigpt.configs.registry import REGISTRY
+
+        if config_name not in REGISTRY:
+            available = ", ".join(sorted(REGISTRY.keys()))
+            raise ValueError(f"Unknown config '{config_name}'. Available: {available}")
+        base_config = REGISTRY[config_name]()
+    else:
+        base_config = TrainConfig()
+
+    # tyro applies CLI overrides on top of the base config
+    return tyro.cli(TrainConfig, args=remaining, default=base_config)
