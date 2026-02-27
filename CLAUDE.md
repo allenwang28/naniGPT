@@ -75,10 +75,13 @@ A cross-cutting concern across the entire project: quantify where Rust can reali
 
 `journal/` contains dated markdown entries that document design decisions, research findings, benchmark results, and lessons learned as the project evolves.
 
-**Format:** `YYYY-MM-DD-topic-name.md` — flat directory, no subdirectories. Dates provide natural ordering.
+**Format:** `YYYY-MM-DD-topic-name.md` within topic subdirectories (e.g. `journal/config_system/`, `journal/parallelisms/`). Dates provide natural ordering within each topic.
+
+**Design first.** Every non-trivial module or feature should have a journal entry exploring the design before implementation begins. The entry should cover the API surface, tradeoff analysis, and key decisions. This forces clear thinking before code is written and gives future-you a record of *why* things are the way they are.
 
 **What goes here:**
-- Design explorations and tradeoff analysis (e.g. comparing config systems before choosing one)
+- Design specs for new modules — API sketches, tradeoff tables, decision rationale
+- Research findings and framework comparisons (e.g. how Megatron vs torchtitan implement TP)
 - Benchmark results and performance comparisons, with actual numbers and tables
 - Things that surprised you or broke your mental model
 - Dead ends worth remembering so you don't revisit them
