@@ -69,7 +69,6 @@ A cross-cutting concern across the entire project: quantify where Rust can reali
 - Supporting arbitrary models or workloads
 - Matching performance of optimized frameworks
 - General-purpose distributed training library
-- Pipeline parallelism (least transferable parallelism strategy)
 
 ## Journal
 
