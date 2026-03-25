@@ -1013,6 +1013,8 @@ single, clear operation. The actor doesn't know about fault tolerance.
 
 ### Background watchers: observing cluster state
 
+TODO - below here needs more work
+
 The controller needs to know about the cluster's health, but it shouldn't be polling
 sidecars synchronously in the training loop — that would add latency to every step.
 Instead, background watchers continuously maintain a `ClusterState` object that the
