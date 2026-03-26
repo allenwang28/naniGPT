@@ -905,47 +905,66 @@ because there's no GPU state to restore.
 
 ## 6. The full picture
 
-Everything from sections 2-5 comes together here. First, what the deployment looks
-like. Then, what the controller actually does — in pseudocode, showing that the training
-framework stays clean while the controller owns all FT complexity.
+Everything from sections 2-5 comes together here. First, the architecture at a glance.
+Then, each component in detail — actors, the control loop, and the recovery policies.
 
-### The deployment
+The controller has two concurrent async concerns: the **health monitor** (observes the
+cluster) and the **control loop** (drives training steps). They communicate through
+shared state: an **EventSource** queue of typed events, and a **WorldView** state
+machine that tracks cluster topology. The health monitor writes; the control loop
+reads and acts.
 
-Two nodes shown, but the pattern repeats for every node in the cluster. Each node runs
-a training process and a sidecar. The controller sits above, receiving reports and
-issuing commands. Each process exposes simple endpoints.
+    ┌──────────────────────────────── Controller ──────────────────────────────────┐
+    │                                                                              │
+    │  HEALTH MONITOR          SHARED STATE            CONTROL LOOP                │
+    │  (async loop)                                     (async loop)               │
+    │                                                                              │
+    │  ┌────────────────┐      ┌──────────────┐        ┌────────────────────────┐  │
+    │  │ poll group     │      │ EventSource  │        │ between steps:         │  │
+    │  │  leaders       │ ───► │ (event queue)│ ◄───── │  drain → WorldView     │  │
+    │  │ poll K8s pods  │write │              │  drain │  needs_reconfigure()?  │  │
+    │  │                │      └──────────────┘        │  → policy.handle()     │  │
+    │  │ produces:      │                              │                        │  │
+    │  │  NodeFailed    │      ┌──────────────┐        │ during steps:          │  │
+    │  │  NodeRecovered │      │  WorldView   │ ◄───── │  drain → WorldView     │  │
+    │  │  HealthUpdate  │      │              │  read  │  needs_abort()?        │  │
+    │  └────────────────┘      │  HEALTHY     │        │  → ncclCommAbort()     │  │
+    │                          │  FAILED      │        │                        │  │
+    │                          │  RECOVERING  │        │ training step:         │  │
+    │                          │  READY_TO_   │        │  forward_backward()    │  │
+    │                          │    JOIN      │        │  optim_step()          │  │
+    │                          └──────────────┘        │  snapshot()            │  │
+    │                                                  │                        │  │
+    │                                                  │  ┌──────────────────┐  │  │
+    │                                                  │  │ Policy           │  │  │
+    │                                                  │  │ ckpt-restart     │  │  │
+    │                                                  │  │ or elastic       │  │  │
+    │                                                  │  └──────────────────┘  │  │
+    │                                                  └───────────┬────────────┘  │
+    │                                                              │               │
+    └───▲──────────────────────────────────────────────────────────┼───────────────┘
+        │ group leader reports                                     │
+        │ + K8s watches                                            │ actor endpoints
+        │                                                          ▼
+    ┌───┴─────────────────────────────────────────────────────────────────────────┐
+    │                      DP Replicas (each = group of nodes)                    │
+    │                                                                             │
+    │  ┌─────────────────────────────┐    ┌─────────────────────────────┐         │
+    │  │ DP Replica 0                │    │ DP Replica 1                │         │
+    │  │                             │    │                             │         │
+    │  │ ┌─────────────────────────┐ │    │ ┌─────────────────────────┐ │         │
+    │  │ │ Group Leader (rank 0)   │ │    │ │ Group Leader (rank 0)   │ │         │
+    │  │ │ • aggregates sidecars   │ │    │ │ • aggregates sidecars   │ │         │
+    │  │ │ • can abort local group │ │    │ │ • can abort local group │ │  ...    │
+    │  │ │ • reports to controller │ │    │ │ • reports to controller │ │         │
+    │  │ └─────────────────────────┘ │    │ └─────────────────────────┘ │         │
+    │  │                             │    │                             │         │
+    │  │ Sidecar+Actor  Sidecar+Actor│    │ Sidecar+Actor  Sidecar+Actor│         │
+    │  │ (rank 0)       (rank 1) ... │    │ (rank 0)       (rank 1) ... │         │
+    │  └─────────────────────────────┘    └─────────────────────────────┘         │
+    └─────────────────────────────────────────────────────────────────────────────┘
 
-    ┌──────────────────────────────────────────────────────────────────┐
-    │                        Controller                                │
-    │                                                                  │
-    │   • /sidecar/report    ← receives health + phase timing          │
-    │   • /trainer/configure ← sends config changes to trainers        │
-    │   • /checkpoint/serve  ← directs P2P checkpoint transfers        │
-    │   • /record            ← logs every decision for replay          │
-    │                                                                  │
-    └────────┬───────────────────────────────────────┬─────────────────┘
-             │                                       │
-             ▼                                       ▼
-    ┌─────── Node 0 (DP Replica 0) ────────┐ ┌────── Node 1 (DP Replica 1) ────────┐
-    │                                      │ │                                     │
-    │  ┌────────────┐  ┌────────────────┐  │ │  ┌────────────┐  ┌───────────────┐  │
-    │  │  Sidecar   │  │   Trainer      │  │ │  │  Sidecar   │  │   Trainer     │  │
-    │  │            │  │                │  │ │  │            │  │               │  │
-    │  │ GET /health│  │ POST /configure│  │ │  │ GET /health│  │POST /configure│  │
-    │  │ GET /phase │  │ GET /metrics   │  │ │  │ GET /phase │  │ GET /metrics  │  │
-    │  │  _timers   │  │ POST /ckpt     │  │ │  │  _timers   │  │ POST /ckpt    │  │
-    │  │            │  │   /serve       │  │ │  │            │  │   /serve      │  │
-    │  │            │  │ POST /ckpt     │  │ │  │            │  │ POST /ckpt    │  │
-    │  │            │  │   /load        │  │ │  │            │  │   /load       │  │
-    │  └────────────┘  └────────────────┘  │ │  └────────────┘  └───────────────┘  │
-    │                                      │ │                                     │
-    │  GPU 0 .. GPU N                      │ │  GPU 0 .. GPU N                     │
-    └──────────────────────────────────────┘ └─────────────────────────────────────┘
-The endpoints are the component contracts from section 4.3, made concrete. The sidecar
-exposes health and phase timing data. The trainer accepts configuration changes and
-exposes metrics. The checkpoint system can serve snapshots to peers or load from a peer.
-The controller is the only process that calls these endpoints — the components don't
-talk to each other directly.
+The rest of this section drills into each component.
 
 ### The actor: a dumb training worker
 
@@ -956,12 +975,23 @@ servers. The point is that the controller makes remote calls to workers, and eac
 returns a handle that can be awaited later. Workers are dumb; they execute what they're
 told and maintain only local state. The controller owns global state and coordination.
 
-This actor pattern is the same one that RL training loops use — Tinker models
-generators, trainers, and inference servers as actors with endpoints, and a controller
-orchestrates the rollout → train → inference sync cycle. We're not designing a fault
-tolerance system and an RL system separately. We're designing a single-controller
-training architecture that handles both. The actor APIs are the same whether the
-controller is driving pre-training steps or RL loops.
+This is worth pausing on, because it's the key architectural bet. Building a
+single-controller system is harder than bolting PAFT onto an SPMD codebase. But the
+payoff extends far beyond fault tolerance. The same actor + controller pattern is
+exactly what RL training loops need — Tinker models generators, trainers, and
+inference servers as actors, and a controller orchestrates the rollout → train →
+inference sync cycle. It's what curriculum scheduling needs — a controller that decides
+what data each replica sees and when to change it. It's what online evaluation needs —
+a controller that can snapshot weights to an eval actor mid-training and collect results
+without interrupting the training loop. Every one of these is a cross-cutting concern
+that, in an SPMD codebase, would require its own set of "if X/else" conditionals
+scattered through the training code. In a single-controller architecture, each is a
+policy or a new actor type — cleanly separated from the training step and from each
+other.
+
+We are paying the single-controller tax once, and getting fault tolerance, RL, curriculum
+control, online eval, and whatever comes next as different compositions of the same
+building blocks.
 
 ```python
 class TrainerActor:
@@ -969,7 +999,22 @@ class TrainerActor:
 
     @endpoint
     async def forward_backward(self, batch) -> Future[Metrics]:
-        """Forward, backward, allreduce. Returns metrics."""
+        """Forward, backward, allreduce. Returns metrics.
+
+        For pre-training, the controller sends an index into the dataset rather
+        than the full batch — each actor has a local data loader that can seek
+        to any position. This keeps the controller lightweight (it sends
+        integers, not tensors) and naturally gives it control over global data
+        ordering, which is the same surface used for elastic data redistribution
+        (section 4.2) and curriculum scheduling. For RL, the controller would
+        send actual rollout data generated by a separate actor.
+
+        Each phase (data loading, forward, backward, allreduce) is instrumented
+        internally — timestamps written to shared memory where the sidecar can
+        read them for straggler detection (section 2.3). Metrics include loss
+        and grad norm, which feed the SDC escalation ladder (section 2.4).
+        """
+        batch = self.data_loader.load(data_index)
         loss = self.model(batch)
         loss.backward()
         dist.all_reduce(self.gradients)  # communication is internal to the actor
@@ -977,7 +1022,8 @@ class TrainerActor:
 
     @endpoint
     async def optim_step(self, lr_scale: float = 1.0) -> Future[None]:
-        """Apply gradients to update model parameters."""
+        """Apply gradients. lr_scale adjusts for degraded operation
+        (section 4.2 — sqrt scaling during elastic recovery)."""
         if lr_scale != 1.0:
             for p in self.model.parameters():
                 p.grad *= lr_scale
@@ -986,226 +1032,279 @@ class TrainerActor:
 
     @endpoint
     async def snapshot(self) -> Future[None]:
+        """Snapshot to host memory — the fast tier from section 3.
+        Sub-second overhead, lost on node failure. This is the recovery
+        source for P2P checkpoint transfer in both hot-swap and elastic."""
         self.checkpoint_manager.snapshot_to_host_memory()
 
     @endpoint
     async def serve_checkpoint(self, dst_addr: str) -> Future[None]:
+        """Send snapshot to a recovering peer (section 4 — P2P transfer
+        from a surviving replica's host memory, no disk I/O)."""
         self.checkpoint_manager.send_to(dst_addr)
 
     @endpoint
     async def load_checkpoint(self, src_addr: str) -> Future[None]:
+        """Receive state from a healthy peer. After loading, the actor
+        enters zero-gradient warmup (section 4.2) until fully synced."""
         self.checkpoint_manager.recv_from(src_addr)
 
     @endpoint
     async def reconfigure(self, config: Config) -> Future[None]:
+        """Rebuild process group for new topology (section 4.3 contracts)."""
         self.rebuild_process_group(config.world_size, config.rank)
-        self.data_loader.seek(config.data_position)
+
 ```
 
-The allreduce is inside `forward_backward` — it's an implementation detail of how
-gradients are synchronized, not something the controller needs to orchestrate. The
-controller cares about "compute gradients" and "apply gradients," matching Tinker's
-`forward_backward` / `optim_step` API. The sidecar can still time the allreduce phase
-internally for straggler detection without the controller being involved.
 
-No quorum checks. No `should_commit()`. No zero-gradient branches. Each endpoint is a
-single, clear operation. The actor doesn't know about fault tolerance.
+### Controller components
 
-### Background watchers: observing cluster state
+**Group leaders** — one per DP replica. Each replica contains multiple nodes (TP/PP
+ranks within the replica). The group leader (rank 0 of each replica) aggregates sidecar
+reports from its nodes and reports a per-replica health summary upward. This serves two
+purposes. First, it reduces the fan-in to the controller — the health monitor talks to
+R group leaders instead of N sidecars (where N >> R). Second, the group leader can
+handle local urgency without waiting for the controller: if a node in its group fails
+mid-collective, the group leader can trigger `ncclCommAbort` within its own process
+group immediately, then report the failure upward. The controller decides what to do
+next (shrink, replace, etc.), but the abort happens locally and fast.
 
-TODO - below here needs more work
+This is the same pattern as torchft's Manager (one per replica, runs on rank 0) and
+axlearn's `replica_manager` (worker_id == 0 in each TPU slice). The group leader
+doesn't make recovery decisions — it observes, aggregates, and can abort its local
+group for urgency.
 
-The controller needs to know about the cluster's health, but it shouldn't be polling
-sidecars synchronously in the training loop — that would add latency to every step.
-Instead, background watchers continuously maintain a `ClusterState` object that the
-control loop reads at step boundaries.
+**Health monitor** — an async loop in the controller that polls group leaders (not
+individual sidecars) and produces typed events into the EventSource queue. Runs
+continuously on its own cadence. This is the only component that knows about K8s — swap
+it for Slurm or bare metal and everything else is unchanged.
 
-This follows the K8s controller pattern: a watch on a resource produces events, and
-the reconcile loop reads the current state when it's ready to act. The watchers observe;
-the control loop decides.
+**EventSource** — a queue of typed events (`NodeFailed`, `NodeRecovered`,
+`HealthUpdate`). The health monitor writes; the control loop drains. A pod crashing
+and a sidecar detecting GPU ECC errors both become the same typed event in the same
+queue.
+
+**WorldView** — the state machine. Consumes typed events and maintains the controller's
+model of the cluster: which replicas are HEALTHY, FAILED, RECOVERING, or READY_TO_JOIN.
+Exposes two queries for the control loop's two modes:
+
+- `needs_reconfigure()` — has the topology changed? Check at step boundaries for
+  proactive handling (a recovered node is ready to rejoin, a straggler was flagged).
+- `needs_abort()` — is something urgent enough to abort in-flight work? Check during
+  the step to avoid waiting for NCCL timeouts.
+
+**Why the health monitor and control loop are separate async concerns.** They operate on
+different timescales. The health monitor polls continuously. The control loop runs at
+step granularity — one step might take 8 seconds. If the health monitor detects a GPU
+failure at t=1s into a step, the control loop needs to know *during* the step, not at
+the next step boundary. Separating them lets the controller react to urgent failures
+mid-step.
+
+### The controllers
+
+Checkpoint-restart and elastic recovery don't share the same loop shape.
+Checkpoint-restart is a simple loop with synchronous recovery. Elastic
+is a stateful loop with background recovery, warm init notifications, and multi-phase
+reconfiguration. Trying to force both into one loop with a policy handler makes the
+simple case carry the complex case's structure.
+
+Instead, each recovery strategy is its own **controller** — a complete `run()`
+implementation that owns its loop shape, state management, and async coordination.
+The controllers share the same building blocks (actors, EventSource, WorldView,
+health monitor), but they're different programs. Switching strategies is choosing
+which controller to run, not configuring a generic one.
+
+Both controllers share the same concurrent health monitoring pattern for mid-step
+abort:
 
 ```python
-class ClusterState:
-    """Maintained by background watchers. Read by the control loop."""
-    def __init__(self):
-        self.node_health: dict[NodeId, HealthReport] = {}
-        self.failed_nodes: list[NodeId] = []
-        self.recovered_nodes: list[NodeId] = []
+async def do_step(trainers, data_scheduler, step):
+    """The training step. Same in all controllers."""
+    data_indices = data_scheduler.next_indices(trainers)
+    metrics = await trainers.forward_backward(data_indices)
+    trainers.optim_step()
+    trainers.snapshot()
+    return metrics
 
-    def needs_shrink(self) -> bool:
-        return len(self.failed_nodes) > 0
+async def step_with_monitoring(trainers, data_scheduler, step, event_source, world):
+    """Run a training step while concurrently monitoring for urgent failures."""
+    step_task = asyncio.create_task(do_step(trainers, data_scheduler, step))
 
-    def needs_grow(self) -> bool:
-        return len(self.recovered_nodes) > 0
+    while not step_task.done():
+        world.ingest(event_source.drain())
+        if world.needs_abort():
+            await abort_collectives(trainers)
+            break
+        await asyncio.sleep(0.1)
 
-async def watch_sidecars(cluster_state: ClusterState):
-    """Background task. Polls sidecars, updates cluster_state continuously."""
-    while True:
-        for node in cluster_state.all_nodes():
-            report = await node.sidecar.get_health()
-            cluster_state.node_health[node.id] = report
-            if not report.healthy and node.id not in cluster_state.failed_nodes:
-                cluster_state.failed_nodes.append(node.id)
-        await asyncio.sleep(poll_interval)
-
-async def watch_standby_pool(cluster_state: ClusterState, standby_pool):
-    """Background task. Recovers failed nodes, signals when ready."""
-    while True:
-        if cluster_state.failed_nodes:
-            for node_id in list(cluster_state.failed_nodes):
-                replacement = await standby_pool.allocate()
-                source = pick_healthy(cluster_state)
-                await source.serve_checkpoint(dst_addr=replacement.addr)
-                await replacement.load_checkpoint(src_addr=source.addr)
-                cluster_state.recovered_nodes.append(replacement)
-                cluster_state.failed_nodes.remove(node_id)
-        await asyncio.sleep(1)
+    return await step_task  # raises StepFailed if aborted
 ```
 
-The watchers run concurrently with the training loop. They update `ClusterState`; the
-control loop reads it. There's no interrupt mechanism — the training step either
-completes or throws an exception. The watchers provide context so the control loop
-knows *what happened* when it's time to act.
-
-### The recovery policy
-
-The policy defines what to do on state transitions. Different policies implement
-different strategies over the same actor endpoints:
+**CheckpointRestartController** — the simple case. On failure, stop everything, get a
+replacement, load checkpoint, reconfigure, resume.
 
 ```python
-class RecoveryPolicy:
-    async def on_shrink(self, cluster_state, trainers) -> list[TrainerActor]:
-        """Called when cluster_state.needs_shrink(). Returns updated trainer list."""
-        raise NotImplementedError
+class CheckpointRestartController:
+    async def run(self, trainers, event_source, world, data_scheduler):
+        step = 0
+        while step < num_steps:
+            # ingest events, check for failures
+            world.ingest(event_source.drain())
 
-    async def on_grow(self, cluster_state, trainers) -> list[TrainerActor]:
-        """Called when cluster_state.needs_grow(). Returns updated trainer list."""
-        raise NotImplementedError
+            if world.has_failed():
+                failed = world.failed_nodes()
+                healthy = world.healthy_trainers()
+                record(event="failure_detected", nodes=failed)
+
+                # get replacement from standby pool
+                for node_id in failed:
+                    standby = world.get_standby()
+                    # P2P checkpoint from healthy peer's memory
+                    source = healthy[0]
+                    await source.serve_checkpoint(dst_addr=standby.addr)
+                    await standby.load_checkpoint(src_addr=source.addr)
+                    world.mark_active(standby)
+
+                # reconfigure all trainers with new topology
+                trainers = world.active_trainers()
+                config = compute_config(trainers)
+                await asyncio.gather(*[t.reconfigure(config) for t in trainers])
+                record(event="recovery_complete")
+
+            # training step
+            try:
+                metrics = await step_with_monitoring(
+                    trainers, data_scheduler, step, event_source, world
+                )
+                record(step, metrics)
+                step += 1
+            except StepFailed as e:
+                record(event="step_failed", error=e)
+                continue
 ```
 
-**Checkpoint-restart with hot swap:** stop everyone, wait for recovery, restart.
+**ElasticController** — the stateful case. On failure, shrink and keep training.
+Recovery happens in the background. When the replacement is warm-initialized, grow
+back.
 
 ```python
-class CheckpointRestartPolicy(RecoveryPolicy):
+class ElasticController:
+    async def run(self, trainers, event_source, world, data_scheduler):
+        step = 0
+        pending_warmup = None  # background recovery task
 
-    async def on_shrink(self, cluster_state, trainers):
-        record(event="failure_detected", nodes=cluster_state.failed_nodes)
-        # nothing to do here — the step already failed.
-        # the background watcher is recovering failed nodes.
-        # we just wait until recovered nodes are available.
-        return [t for t in trainers if t.node_id not in cluster_state.failed_nodes]
+        while step < num_steps:
+            world.ingest(event_source.drain())
 
-    async def on_grow(self, cluster_state, trainers):
-        # recovered nodes are ready — add them back and reconfigure everyone
-        recovered = cluster_state.pop_recovered()
-        all_trainers = trainers + recovered
-        config = compute_config(all_trainers)
-        await asyncio.gather(*[t.reconfigure(config) for t in all_trainers])
-        record(event="recovery_complete")
-        return all_trainers
+            # --- shrink: a node failed, reconfigure with fewer replicas ---
+            if world.has_failed():
+                failed = world.failed_nodes()
+                record(event="failure_detected", nodes=failed)
+
+                # reconfigure healthy trainers to exclude failed (R → R-1)
+                trainers = world.healthy_trainers()
+                lr_scale = math.sqrt(len(trainers) / (len(trainers) + len(failed)))
+                config = compute_config(trainers, lr_scale=lr_scale)
+                await asyncio.gather(*[t.reconfigure(config) for t in trainers])
+                record(event="degraded_operation", replicas=len(trainers))
+
+                # mark failed nodes for cloud eviction if hardware-related
+                for node_id in failed:
+                    if world.failure_reason(node_id).is_hardware:
+                        mark_for_cloud_eviction(node_id)
+
+                # kick off background recovery: get standby, warm init
+                pending_warmup = asyncio.create_task(
+                    self._warm_init(world, trainers)
+                )
+
+            # --- grow: warm init completed, add recovered replica back ---
+            if pending_warmup and pending_warmup.done():
+                warmed_node = pending_warmup.result()
+                pending_warmup = None
+
+                # reconfigure all trainers to include recovered (R-1 → R)
+                trainers.append(warmed_node)
+                config = compute_config(trainers, recovering=[warmed_node])
+                await asyncio.gather(*[t.reconfigure(config) for t in trainers])
+                record(event="recovery_complete")
+
+            # training step
+            try:
+                metrics = await step_with_monitoring(
+                    trainers, data_scheduler, step, event_source, world
+                )
+                record(step, metrics)
+                step += 1
+            except StepFailed as e:
+                record(event="step_failed", error=e)
+                continue
+
+    async def _warm_init(self, world, healthy_trainers):
+        """Background task: get standby, load checkpoint, return warmed node."""
+        standby = world.get_standby()
+        source = healthy_trainers[0]
+        await source.serve_checkpoint(dst_addr=standby.addr)
+        await standby.load_checkpoint(src_addr=source.addr)
+        return standby
 ```
 
-**Elastic HSDP:** healthy replicas continue, recovery happens in the background.
+The training step is the same three lines in both controllers —
+`forward_backward → optim_step → snapshot`. The difference is entirely in the control
+flow *around* it. The `CheckpointRestartController` handles recovery synchronously
+before the step. The `ElasticController` handles shrink synchronously, kicks off
+recovery in the background, and picks up the result when it's ready.
 
-```python
-class ElasticPolicy(RecoveryPolicy):
+Notice what WorldView does here: the controllers call `world.has_failed()`,
+`world.healthy_trainers()`, `world.get_standby()`, `world.mark_active()`. WorldView
+tracks all node state — active, standby, failed, recovering — and the controllers
+read and write through it. There's no separate NodeManager; WorldView *is* the
+complete model of the world.
 
-    async def on_shrink(self, cluster_state, trainers):
-        record(event="failure_detected", nodes=cluster_state.failed_nodes)
+Let's trace a concrete scenario through the `ElasticController`:
 
-        # reconfigure healthy trainers to exclude failed replicas (R → R-1)
-        healthy = [t for t in trainers if t.node_id not in cluster_state.failed_nodes]
-        lr_scale = math.sqrt(len(healthy) / len(trainers))
-        degraded_config = compute_config(healthy, lr_scale=lr_scale)
-        await asyncio.gather(*[t.reconfigure(degraded_config) for t in healthy])
-
-        record(event="degraded_operation", replicas=len(healthy))
-        return healthy  # continue training with fewer replicas
-
-    async def on_grow(self, cluster_state, trainers):
-        # recovered replicas ready — add them back (R-1 → R)
-        recovered = cluster_state.pop_recovered()
-        all_trainers = trainers + recovered
-        full_config = compute_config(all_trainers, recovering=recovered)
-        await asyncio.gather(*[t.reconfigure(full_config) for t in all_trainers])
-
-        record(event="recovery_complete")
-        return all_trainers
+**GPU ECC failure on node-3, mid-step:**
+```
+t=0.0s  step begins — do_step() fires forward_backward on all replicas
+t=1.2s  sidecar on node-3 detects ECC errors, writes to K8s
+t=1.4s  health monitor picks it up, puts NodeFailed in EventSource
+t=1.5s  concurrent monitor drains it, WorldView marks node-3 FAILED
+t=1.5s  needs_abort() returns true — controller triggers ncclCommAbort
+t=1.6s  in-flight allreduce on nodes 0-2 aborts immediately
+t=1.6s  step_task raises StepFailed, control loop catches, continues
+t=1.6s  next iteration: world.has_failed() returns true
+t=1.6s  ElasticController shrinks to 3 replicas, starts background warm init
+t=1.6s  training continues at 3/4 throughput with sqrt LR scaling
+  ...   (background: standby allocated, P2P checkpoint transferred)
+t=12s   pending_warmup.done() — warmed node ready
+t=12s   ElasticController grows back to 4 replicas, reconfigures all
+t=12s   full throughput resumed
 ```
 
-### The control loop
-
-Everything converges here. The control loop is the training loop — it drives actors
-through Tinker-style endpoint calls and handles state transitions at step boundaries
-via the policy. Background watchers maintain `ClusterState`; the loop reads it.
-
-FT decisions naturally synchronize at step boundaries. A training step is
-forward → backward → allreduce → optimizer step — these are synchronous from the
-controller's perspective. You can't meaningfully interrupt mid-step. So the loop has
-two paths: **proactive** (check state at the top of each step) and **reactive** (catch
-exceptions from a failed step, consult state to understand why).
-
-```python
-async def run(trainers, data_loader, policy, cluster_state):
-    # background watchers maintain cluster_state concurrently
-    asyncio.create_task(watch_sidecars(cluster_state))
-    asyncio.create_task(watch_standby_pool(cluster_state, standby_pool))
-
-    step = 0
-    while step < num_steps:
-
-        # --- proactive: check watcher state at step boundary ---
-        if cluster_state.needs_shrink():
-            trainers = await policy.on_shrink(cluster_state, trainers)
-        if cluster_state.needs_grow():
-            trainers = await policy.on_grow(cluster_state, trainers)
-
-        # --- training step ---
-        try:
-            batch = await data_loader.next_batch()
-            metrics = await trainers.forward_backward(batch)
-
-            trainers.optim_step()
-            trainers.snapshot()
-
-            record(step, metrics)
-            step += 1
-
-        except StepFailed as e:
-            # reactive: step failed, watcher already knows why
-            cluster_state.correlate(e)  # enrich with watcher diagnostics
-            record(event="mid_step_failure", error=e, diagnosis=cluster_state)
-            continue  # will be caught by needs_shrink() next iteration
-```
-
-The training step — `forward_backward → optim_step → snapshot` — is the
-same four lines regardless of mode. The policy handles everything else. The watchers
-provide continuous observability without blocking the loop. And the `record()` calls
-capture every decision for the replay log from section 5.
-
-When a step fails (reactive path), the exception propagates up from the actor futures.
-The loop doesn't try to diagnose the failure itself — it asks `cluster_state` to
-correlate the exception with the watcher's diagnostics. The watcher has been
-maintaining health data continuously, so by the time the exception arrives, the
-diagnosis is usually already there: "node X's sidecar reported GPU ECC errors 3
-seconds ago." The next loop iteration sees `needs_shrink()` and calls the policy.
+Detection-to-shrink: ~400ms. Training never stopped on healthy replicas.
 
 ### What this buys us
 
-**Same actors, same loop, different policy.** At 128 GPUs, instantiate
-`CheckpointRestartPolicy`. At 10K+ GPUs, switch to `ElasticPolicy`. The actor code
-is identical. The control loop is identical. The watchers are identical. Only the
-policy changes.
+**Same actors, different controllers.** At 128 GPUs, run `CheckpointRestartController`.
+At 10K+ GPUs, run `ElasticController`. The actor code is identical. The health monitor
+is identical. The WorldView is identical. The controllers use the same building blocks
+but have different loop shapes.
 
 **FT and RL share the same architecture.** The actor endpoints, the controller-driven
-loop, the background watchers — this is the same pattern an RL loop uses. Swap
-"on_shrink / on_grow" for "generate rollouts / update policy / sync weights to
-inference" and the shape is the same. Building a single-controller training
-architecture means fault tolerance and RL are two policies over the same
-infrastructure, not two separate systems.
+loop, the async event monitoring — this is the same pattern an RL loop uses. An RL
+controller would be a third implementation with its own loop shape (generate rollouts →
+score → train → sync weights to inference), using the same actors and event
+infrastructure.
 
-**Record/replay for free.** The `record()` calls throughout the control loop and
-policies capture the complete training history: cluster state at each step, every
-failure event, every recovery decision, every configuration change. Replaying a
-training run is feeding this log into a fresh controller — the actors don't need to
-know they're in a replay.
+**Record/replay for free.** The `record()` calls capture every step, every failure,
+every configuration change. Replay is a third controller implementation —
+`ReplayController` — that reads from the recorded log instead of live events. It
+drives the same actors through the same training steps with the same data indices and
+the same configuration changes. The actors don't know they're in a replay.
+
+This is useful for debugging elastic training's numerical behavior (section 1) —
+replay a run with recorded failure events and study the loss trajectory, gradient
+noise, and LR scaling effects in isolation. It's also useful for validating the FT
+system itself — replay a recorded failure sequence through a new controller
+implementation and verify it produces the right recovery decisions.
+
