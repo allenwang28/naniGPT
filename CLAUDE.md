@@ -95,6 +95,20 @@ Entries can be revisited and updated — add a dated addendum rather than rewrit
 
 **Citing external code:** When referencing code in other frameworks, link to the specific file on GitHub pinned to the commit hash we're working from (not `main`, which drifts). Use the format `https://github.com/org/repo/blob/<commit_hash>/path/to/file.py#L42-L60`. No links for internal/non-open-source codebases.
 
+## Data Preparation
+
+Configs that use real data (e.g. `small-fineweb`, `medium-fineweb-fsdp`) expect pre-tokenized memmap files in `data/`. Prepare them with:
+
+```bash
+# 1M tokens (default for small-fineweb)
+uv run python -m nanigpt.data.prepare --num-tokens 1_000_000 --output-dir data/fineweb-1M
+
+# 10M tokens
+uv run python -m nanigpt.data.prepare --num-tokens 10_000_000 --output-dir data/fineweb-10M
+```
+
+This downloads from `HuggingFaceFW/fineweb-edu`, tokenizes with GPT-2's tokenizer, and writes `train.bin`, `val.bin`, and `meta.json` to the output directory.
+
 ## Project Conventions
 
 - **Use `uv` for everything.** Package management, running scripts (`uv run python -m nanigpt.train`), adding dependencies (`uv add`), etc. No pip, no conda, no venv manually.

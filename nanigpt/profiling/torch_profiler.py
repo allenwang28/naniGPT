@@ -35,6 +35,14 @@ from nanigpt.profiling.context import get_step, unregister_step_end
 log = logging.getLogger(__name__)
 
 
+_NCCL_PREFIXES = ("nccl", "ncclKernel", "ncclDevKernel")
+
+
+def _is_comm_kernel(name: str) -> bool:
+    """Return True if the kernel name is an NCCL communication op."""
+    return any(name.startswith(p) for p in _NCCL_PREFIXES)
+
+
 def _print_kernel_table(averages: list, top_n: int) -> None:
     """Format key_averages() as a terminal table sorted by self GPU time."""
     # Filter to entries with non-zero self GPU time, sort descending
@@ -74,6 +82,17 @@ def _print_kernel_table(averages: list, top_n: int) -> None:
         rest_gpu_us = sum(e.self_device_time_total for e in rest)
         rest_pct = 100.0 * rest_gpu_us / total_gpu_us if total_gpu_us else 0
         log.info(f"\033[2m... {len(rest)} more ops ({rest_pct:.1f}% of GPU time)\033[0m")
+
+    # Compute vs communication breakdown
+    comm_us = sum(e.self_device_time_total for e in gpu_entries if _is_comm_kernel(e.key))
+    compute_us = total_gpu_us - comm_us
+    if comm_us > 0:
+        comm_pct = 100.0 * comm_us / total_gpu_us
+        compute_pct = 100.0 * compute_us / total_gpu_us
+        log.info(
+            f"Compute: {compute_us / 1000:.2f} ms ({compute_pct:.1f}%)"
+            f" | Communication: {comm_us / 1000:.2f} ms ({comm_pct:.1f}%)"
+        )
 
     # CPU/GPU ratio as launch overhead indicator
     if total_gpu_us > 0:

@@ -6,7 +6,7 @@ to select a preset, then override individual fields with tyro flags.
 
 from collections.abc import Callable
 
-from nanigpt.config import EvalConfig, TrainConfig, TrainingConfig
+from nanigpt.config import EvalConfig, ParallelConfig, TrainConfig, TrainingConfig
 from nanigpt.data.synthetic import SyntheticData
 from nanigpt.data.tokenized import TokenizedData
 from nanigpt.models.dense_transformer import MODEL_PRESETS
@@ -53,6 +53,27 @@ def medium_fineweb() -> TrainConfig:
     return config
 
 
+def small_synthetic_ddp() -> TrainConfig:
+    """Small synthetic with DDP on 2 GPUs."""
+    config = small_synthetic()
+    config.parallel = ParallelConfig(plan="ddp", num_workers=2)
+    return config
+
+
+def small_synthetic_fsdp() -> TrainConfig:
+    """Small synthetic with FSDP on 2 GPUs."""
+    config = small_synthetic()
+    config.parallel = ParallelConfig(plan="fsdp", num_workers=2)
+    return config
+
+
+def medium_fineweb_fsdp() -> TrainConfig:
+    """Medium model on real data with FSDP on 8 GPUs."""
+    config = medium_fineweb()
+    config.parallel = ParallelConfig(plan="fsdp", num_workers=8)
+    return config
+
+
 # ---- Registry map ----
 
 REGISTRY: dict[str, Callable[[], TrainConfig]] = {
@@ -60,4 +81,7 @@ REGISTRY: dict[str, Callable[[], TrainConfig]] = {
     "small-fineweb": small_fineweb,
     "small-synthetic-long": small_synthetic_long,
     "medium-fineweb": medium_fineweb,
+    "medium-fineweb-fsdp": medium_fineweb_fsdp,
+    "small-synthetic-ddp": small_synthetic_ddp,
+    "small-synthetic-fsdp": small_synthetic_fsdp,
 }
