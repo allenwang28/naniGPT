@@ -7,6 +7,7 @@ dependencies = [
     "datasets",
     "numpy",
     "tiktoken",
+    "ray[default]>=2.40",
     "torch>=2.10",
     "triton>=3.6",
     "tyro",

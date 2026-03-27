@@ -6,6 +6,7 @@ type alias, and parse_config() for CLI parsing via tyro.
 
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Annotated, Literal
 
 import torch
@@ -81,6 +82,15 @@ class LoggingConfig:
 
 
 @dataclass(kw_only=True, slots=True)
+class ParallelConfig:
+    """Parallelism settings."""
+
+    plan: Literal["none", "ddp", "fsdp"] = "none"
+    num_workers: int = 1
+    backend: str = "nccl"
+
+
+@dataclass(kw_only=True, slots=True)
 class TrainConfig:
     """Root configuration for a training run."""
 
@@ -90,6 +100,40 @@ class TrainConfig:
     eval: EvalConfig = field(default_factory=EvalConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     profiler: TorchProfiler.Config = field(default_factory=TorchProfiler.Config)
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
+
+    def validate(self) -> None:
+        """Run preflight checks that catch problems before heavy initialization.
+
+        Called once on the launcher process before spawning workers, so errors
+        surface immediately instead of minutes later inside a Ray actor.
+        """
+        errors: list[str] = []
+
+        # Check data files exist for tokenized data configs.
+        # Resolve to absolute path so Ray workers (which run from /tmp/ray/...)
+        # can find the files regardless of working directory.
+        if isinstance(self.data, TokenizedData.Config):
+            data_path = Path(self.data.data_dir).resolve()
+            self.data.data_dir = str(data_path)
+            for split in ("train", "val"):
+                bin_path = data_path / f"{split}.bin"
+                if not bin_path.exists():
+                    errors.append(
+                        f"Data file not found: {bin_path}\n"
+                        f"  Run: uv run python -m nanigpt.data.prepare "
+                        f"--num-tokens 1_000_000 --output-dir {self.data.data_dir}"
+                    )
+
+        # Check GPU availability (only on the local node — multi-host
+        # setups may have GPUs elsewhere that we can't see here)
+        if self.training.device == "cuda" and not torch.cuda.is_available():
+            errors.append("Config requires CUDA but no GPU is available")
+
+        if errors:
+            raise RuntimeError(
+                "Config validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
+            )
 
 
 def parse_config(args: list[str] | None = None) -> TrainConfig:

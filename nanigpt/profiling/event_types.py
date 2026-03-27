@@ -15,3 +15,4 @@ class EventType(StrEnum):
     BACKWARD = "backward"
     OPTIMIZER = "optimizer"
     EVAL = "eval"
+    COMMUNICATION = "communication"
