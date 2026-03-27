@@ -1308,3 +1308,51 @@ noise, and LR scaling effects in isolation. It's also useful for validating the 
 system itself — replay a recorded failure sequence through a new controller
 implementation and verify it produces the right recovery decisions.
 
+
+## 7. What's still incomplete
+
+This entry explored the design space and landed on an architecture — single-controller,
+actor-based workers, async health monitoring, strategy-specific controllers over shared
+components. The structure feels right, but the design isn't bulletproof yet. Before
+writing a full design doc or implementation plan, several things need more work:
+
+**Adversarial scenario analysis.** We traced one failure scenario (GPU ECC mid-step)
+through the elastic controller. A real design needs to survive harder cases: multiple
+simultaneous failures, failure during reconfiguration (some trainers have the new
+config, some have the old), controller failure mid-recovery, cascading failures that
+exhaust the standby pool, false positives from sidecars, and SDC during elastic
+operation (where loss spikes are ambiguous — is it corruption or expected noise from
+fewer replicas?). Each of these could crack an abstraction that looks clean in the
+single-failure case.
+
+**WorldView state machine formalization.** We sketched the states (ACTIVE, STANDBY,
+FAILED, RECOVERING) but haven't formalized the valid transitions, or what happens
+when events arrive in unexpected order. A proper state machine with defined transitions
+and error states would catch design bugs before implementation.
+
+**Group leader protocol.** We introduced group leaders as per-replica aggregators that
+can abort their local group for urgency. The exact protocol — what the group leader
+reports, how often, how the controller discovers group leaders, what happens when a
+group leader itself fails — needs to be worked out.
+
+**Standby pool sizing and lifecycle.** How many standbys, how to provision them, how
+to health-check before accepting into the pool, how to replenish after use. The
+previous entry covered ByteRobust's binomial model for pool sizing, but the operational
+details (where do standbys come from, how long do they stay idle, what's the cost
+tradeoff) are unresolved.
+
+**Integration with existing training code.** The actor definition assumes clean
+endpoints like `forward_backward` and `reconfigure`. Wrapping an existing SPMD training
+step (Megatron, FSDP) behind these endpoints is mechanical but non-trivial — especially
+process group reconstruction on `reconfigure()`. The gap between the pseudocode and a
+working implementation needs to be mapped.
+
+**Testing strategy.** The architecture is testable at every layer in principle
+(mock EventSource, mock WorldView, mock actors). But the integration tests — does
+the elastic controller actually recover correctly when a real GPU fails on a real
+cluster? — require infrastructure we don't have yet.
+
+The goal of this entry was to build enough clarity on the structure that a full design
+can proceed with confidence. The next step is picking the hardest adversarial scenarios
+above and tracing them through until either the design holds or we learn what needs to
+change.
