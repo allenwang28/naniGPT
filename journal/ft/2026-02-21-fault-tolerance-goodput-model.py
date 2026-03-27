@@ -11,15 +11,17 @@ import numpy as np
 # 8 GPUs per server
 LAMBDA_PER_GPU = 0.0023 / 8 / 86400  # failures/GPU/second
 
-T_ITER = 2.0          # seconds per training step
-T_STALL = 0.5         # checkpoint stall (ByteCheckpoint steady-state)
-T_SAVE = 40.0         # end-to-end save (background, overlapped)
-T_LOAD = 150.0        # checkpoint load time
+T_ITER = 2.0  # seconds per training step
+T_STALL = 0.5  # checkpoint stall (ByteCheckpoint steady-state)
+T_SAVE = 40.0  # end-to-end save (background, overlapped)
+T_LOAD = 150.0  # checkpoint load time
+
 
 # Cold recovery: fit from Meta's Figure 2 (section 2)
 # ~200s at 16K, ~600s at 64K, ~900s at 98K
 def t_cold(n_gpus):
     return 50 + 0.009 * n_gpus  # rough linear fit in seconds
+
 
 # Elastic recovery (FT-HSDP): ~180s at 98K GPUs
 T_ELASTIC = 180.0
@@ -31,6 +33,7 @@ P_CORRELATED = 0.05
 # --- GPU counts to sweep ---
 gpu_counts = np.logspace(np.log10(1000), np.log10(200_000), 200)
 
+
 def mtbf(n_gpus):
     """Cluster MTBF in seconds. Uses empirical superlinear correction."""
     # Linear: MTBF = 1 / (N * lambda)
@@ -41,9 +44,11 @@ def mtbf(n_gpus):
     correction = (n_ref / n_gpus) ** 0.9 if n_gpus > n_ref else 1.0
     return mtbf_linear * correction
 
+
 def optimal_ckpt_interval(mtbf_s, t_stall):
     """Young's formula: optimal interval in seconds."""
     return np.sqrt(2 * mtbf_s * t_stall)
+
 
 def goodput_sync(n_gpus):
     m = mtbf(n_gpus)
@@ -54,6 +59,7 @@ def goodput_sync(n_gpus):
     t_wasted = (cycle / m) * (n_steps * T_ITER / 2 + t_cold(n_gpus))
     productive = n_steps * T_ITER - t_wasted
     return max(0, productive / cycle)
+
 
 def goodput_elastic(n_gpus, n_replicas):
     m = mtbf(n_gpus)
@@ -67,6 +73,7 @@ def goodput_elastic(n_gpus, n_replicas):
     # Correlated failure penalty (still need full restart)
     correlated_penalty = P_CORRELATED * (n_steps * T_ITER / 2 + t_cold(n_gpus)) / m
     return max(0, 1.0 - ckpt_overhead - degraded_frac - correlated_penalty)
+
 
 # --- Compute ---
 gp_sync = [goodput_sync(n) for n in gpu_counts]

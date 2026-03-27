@@ -11,7 +11,7 @@ from nanigpt.profiling.context import (
     step_context,
     unregister_step_end,
 )
-from nanigpt.profiling.torch_profiler import ProfilerConfig, TorchProfiler
+from nanigpt.profiling.torch_profiler import TorchProfiler
 
 
 @pytest.fixture(autouse=True)
@@ -25,7 +25,7 @@ def _reset_context():
 
 
 def test_profiler_config_defaults():
-    config = ProfilerConfig()
+    config = TorchProfiler.Config()
     assert config.enabled is True
     assert config.start_step == 10
     assert config.end_step == 12
@@ -39,7 +39,7 @@ def test_profiler_config_defaults():
 
 def test_torch_profiler_disabled():
     """enabled=False should be a complete no-op — no callback effect."""
-    profiler = TorchProfiler(ProfilerConfig(enabled=False))
+    profiler = TorchProfiler(TorchProfiler.Config(enabled=False))
     register_step_end(profiler)
     assert profiler._profiler is None
     # Calling it does nothing
