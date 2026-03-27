@@ -45,26 +45,27 @@ def evaluate(model, val_loader, model_config, device, dtype, val_steps):
     count = 0
     val_iter = iter(val_loader)
 
-    for _ in range(val_steps):
-        try:
-            batch = next(val_iter)
-        except StopIteration:
-            val_iter = iter(val_loader)
-            batch = next(val_iter)
+    with torch.no_grad():
+        for _ in range(val_steps):
+            try:
+                batch = next(val_iter)
+            except StopIteration:
+                val_iter = iter(val_loader)
+                batch = next(val_iter)
 
-        tokens = batch.to(device, non_blocking=True)
-        input_ids = tokens[:, :-1]
-        targets = tokens[:, 1:]
+            tokens = batch.to(device, non_blocking=True)
+            input_ids = tokens[:, :-1]
+            targets = tokens[:, 1:]
 
-        with torch.amp.autocast(device_type="cuda", dtype=dtype):
-            output = model(input_ids)
-            loss = F.cross_entropy(
-                output.logits.view(-1, model_config.vocab_size),
-                targets.reshape(-1),
-            )
+            with torch.amp.autocast(device_type="cuda", dtype=dtype):
+                output = model(input_ids)
+                loss = F.cross_entropy(
+                    output.logits.view(-1, model_config.vocab_size),
+                    targets.reshape(-1),
+                )
 
-        total_loss += loss.item()
-        count += 1
+            total_loss += loss.item()
+            count += 1
 
     model.train()
     avg_loss = total_loss / count
@@ -225,7 +226,8 @@ def train_worker(rank: int, world_size: int, config: TrainConfig) -> None:
                 optimizer.step()
 
         timings = get_global_metrics().last_step_ms()
-        total_ms = sum(timings.values())
+        train_timings = {k: v for k, v in timings.items() if k != EventType.EVAL.value}
+        total_ms = sum(train_timings.values())
         tflops = flop_counter.achieved_tflops(step_flops, total_ms)
         utilization = flop_counter.mfu(tflops, gpu_name)
         tok_per_sec = tokens_per_step / (total_ms / 1000.0)
@@ -240,7 +242,7 @@ def train_worker(rank: int, world_size: int, config: TrainConfig) -> None:
             "tokens_per_sec": tok_per_sec,
             "tflops": tflops,
             "mfu": utilization,
-            **{f"time/{k}": v for k, v in timings.items()},
+            **{f"time/{k}": v for k, v in train_timings.items()},
         }
 
         # ---- Validation ----
@@ -315,6 +317,7 @@ def train_worker(rank: int, world_size: int, config: TrainConfig) -> None:
         log.info(f"Peak memory: {peak_mem:.2f} GB")
         if profiler is not None:
             profiler.print_summary()
+            profiler.serve_perfetto()
 
         summary = {
             "wall_time_s": wall_time,

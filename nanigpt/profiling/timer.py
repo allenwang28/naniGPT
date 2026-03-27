@@ -32,7 +32,6 @@ can be overridden for timing work on non-default streams.
 import logging
 import threading
 import time
-from collections import defaultdict
 from contextlib import ContextDecorator
 
 import torch
@@ -100,7 +99,7 @@ class StepMetrics:
     def __init__(self):
         self._pending: list[tuple[EventType, CUDATimer]] = []
         self._current: dict[str, float] = {}
-        self._history: dict[str, list[float]] = defaultdict(list)
+        self._history: list[dict[str, float]] = []
 
     def record_pending(self, event_type: EventType, timer: CUDATimer) -> None:
         """Stash a timer for resolution at step boundary."""
@@ -119,27 +118,38 @@ class StepMetrics:
             self._current[key] = self._current.get(key, 0.0) + elapsed
         self._pending.clear()
 
-        for key, ms in self._current.items():
-            self._history[key].append(ms)
+        self._history.append(dict(self._current))
         self._current.clear()
 
     def last_step_ms(self) -> dict[str, float]:
-        """Return timings from the most recent step."""
-        return {name: times[-1] for name, times in self._history.items() if times}
+        """Return timings from the most recent step only."""
+        if not self._history:
+            return {}
+        return dict(self._history[-1])
 
     def mean_ms(self) -> dict[str, float]:
         """Return mean timings across all recorded steps."""
-        return {name: sum(times) / len(times) for name, times in self._history.items() if times}
+        if not self._history:
+            return {}
+        all_keys = {k for step in self._history for k in step}
+        return {
+            key: sum(step.get(key, 0.0) for step in self._history)
+            / sum(1 for step in self._history if key in step)
+            for key in all_keys
+        }
 
     def report(self, last_n: int = 1) -> str:
         """Format a profiling report for the last N steps."""
         if last_n == 1:
             timings = self.last_step_ms()
         else:
-            timings = {}
-            for name, times in self._history.items():
-                recent = times[-last_n:]
-                timings[name] = sum(recent) / len(recent)
+            recent = self._history[-last_n:]
+            all_keys = {k for step in recent for k in step}
+            timings = {
+                key: sum(step.get(key, 0.0) for step in recent)
+                / sum(1 for step in recent if key in step)
+                for key in all_keys
+            }
 
         total = sum(timings.values())
         if total == 0:
