@@ -114,3 +114,5 @@ This downloads from `HuggingFaceFW/fineweb-edu`, tokenizes with GPT-2's tokenize
 - **Use `uv` for everything.** Package management, running scripts (`uv run python -m nanigpt.train`), adding dependencies (`uv add`), etc. No pip, no conda, no venv manually.
 - **Lint and format with `ruff`.** Run `uv run ruff check .` and `uv run ruff format .` before committing. Config lives in `pyproject.toml`.
 - **Use f-strings for formatting.** Prefer `f"step {step}"` over `"step %d" % step` or `"step {}".format(step)`. This applies everywhere including `logging` calls — use `log.info(f"step {step}")` not `log.info("step %d", step)`.
+- **No directory structure trees in docstrings.** They go stale immediately as files are added/renamed. The filesystem *is* the directory structure — use `ls` or your editor. Docstrings should explain *how things work*, not *what files exist*.
+- **Megatron-derived code is renamed for readability.** When adapting from Megatron, use our names (e.g. `enter/exit_parallel_region` not `CopyTo/ReduceFrom`). The original-to-ours mapping lives in the relevant module's docstring.

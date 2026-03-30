@@ -56,21 +56,28 @@ def medium_fineweb() -> TrainConfig:
 def small_synthetic_ddp() -> TrainConfig:
     """Small synthetic with DDP on 2 GPUs."""
     config = small_synthetic()
-    config.parallel = ParallelConfig(plan="ddp", num_workers=2)
+    config.parallel = ParallelConfig(dp_replicate=2, dp_shard=1, num_workers=2)
     return config
 
 
 def small_synthetic_fsdp() -> TrainConfig:
     """Small synthetic with FSDP on 2 GPUs."""
     config = small_synthetic()
-    config.parallel = ParallelConfig(plan="fsdp", num_workers=2)
+    config.parallel = ParallelConfig(dp_shard=2, num_workers=2)
+    return config
+
+
+def small_synthetic_tp() -> TrainConfig:
+    """Small synthetic with TP on 2 GPUs."""
+    config = small_synthetic()
+    config.parallel = ParallelConfig(tp_size=2, num_workers=2)
     return config
 
 
 def medium_fineweb_fsdp() -> TrainConfig:
     """Medium model on real data with FSDP on 8 GPUs."""
     config = medium_fineweb()
-    config.parallel = ParallelConfig(plan="fsdp", num_workers=8)
+    config.parallel = ParallelConfig(num_workers=8)
     return config
 
 
@@ -84,4 +91,5 @@ REGISTRY: dict[str, Callable[[], TrainConfig]] = {
     "medium-fineweb-fsdp": medium_fineweb_fsdp,
     "small-synthetic-ddp": small_synthetic_ddp,
     "small-synthetic-fsdp": small_synthetic_fsdp,
+    "small-synthetic-tp": small_synthetic_tp,
 }

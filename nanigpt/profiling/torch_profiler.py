@@ -63,9 +63,7 @@ def _parse_windows(windows_str: str) -> list[tuple[int, int]]:
         start_str, end_str = part.split("-", 1)
         start, end = int(start_str), int(end_str)
         if end <= start:
-            raise ValueError(
-                f"Window end ({end}) must be > start ({start}) in '{part}'."
-            )
+            raise ValueError(f"Window end ({end}) must be > start ({start}) in '{part}'.")
         result.append((start, end))
 
     # Sort by start step

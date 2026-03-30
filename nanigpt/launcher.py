@@ -6,9 +6,10 @@ so each actor sees device 0 locally.
 """
 
 import logging
-import os
 
 import ray
+
+from nanigpt.env import MASTER_ADDR, MASTER_PORT
 
 log = logging.getLogger("launcher")
 
@@ -20,8 +21,8 @@ class TrainingWorker:
     def __init__(self, rank: int, world_size: int, master_addr: str, master_port: str):
         self.rank = rank
         self.world_size = world_size
-        os.environ["MASTER_ADDR"] = master_addr
-        os.environ["MASTER_PORT"] = master_port
+        MASTER_ADDR.set_value(master_addr)
+        MASTER_PORT.set_value(master_port)
 
     def run(self, config) -> None:
         """Run the training loop for this rank with the given config."""
@@ -40,8 +41,8 @@ def launch(config, num_workers: int) -> None:
     # .rayignore at project root excludes .venv from packaging.
     ray.init(ignore_reinit_error=True)
 
-    master_addr = os.environ.get("MASTER_ADDR", "localhost")
-    master_port = os.environ.get("MASTER_PORT", "29500")
+    master_addr = MASTER_ADDR.get_value()
+    master_port = MASTER_PORT.get_value()
 
     log.info(f"Launching {num_workers} workers via Ray ({master_addr}:{master_port})")
 

@@ -83,11 +83,35 @@ class LoggingConfig:
 
 @dataclass(kw_only=True, slots=True)
 class ParallelConfig:
-    """Parallelism settings."""
+    """Parallelism settings.
 
-    plan: Literal["none", "ddp", "fsdp"] = "none"
+    Each dimension is an independent degree. Set them individually and they
+    compose via the DeviceMesh. The product of all degrees must equal
+    num_workers. dp_shard=-1 (default) auto-fills with remaining ranks.
+
+    See nanigpt/distributed/__init__.py for how these dimensions compose,
+    mesh layout, and application order.
+    """
+
+    dp_replicate: int = 1
+    dp_shard: int = -1
+    tp_size: int = 1
     num_workers: int = 1
     backend: str = "nccl"
+
+    def __post_init__(self):
+        # Auto-fill dp_shard with remaining ranks
+        if self.dp_shard == -1:
+            self.dp_shard = self.num_workers // (self.dp_replicate * self.tp_size)
+
+        # Validate product constraint
+        total = self.dp_replicate * self.dp_shard * self.tp_size
+        if total != self.num_workers:
+            raise ValueError(
+                f"dp_replicate ({self.dp_replicate}) × dp_shard ({self.dp_shard}) "
+                f"× tp_size ({self.tp_size}) = {total}, "
+                f"but num_workers = {self.num_workers}"
+            )
 
 
 @dataclass(kw_only=True, slots=True)

@@ -1,31 +1,53 @@
 """Distributed runtime: process groups, mesh, and model wrapping.
 
 This package owns the entire distributed concern — from process group
-lifecycle to parallelism application. No globals; the DeviceMesh is
-created once and passed explicitly.
+lifecycle to parallelism application.
 
-Directory structure (current and planned):
-    distributed/
-    ├── __init__.py           # Process group lifecycle + re-exports
-    ├── mesh.py               # DeviceMesh creation
-    ├── data_parallel.py      # DDP / FSDP wrapping
-    ├── plan.py               # ParallelPlan dataclass
-    ├── comm.py               # Autograd.Function conjugate pairs (stub)
-    ├── tensor_parallel.py    # (future) TP as functions, not layers
-    ├── expert_parallel.py    # (future) EP dispatch/combine strategies
-    └── pipeline_parallel.py  # (future) PP schedule IR + execution
+Parallelism composition
+-----------------------
+Each parallelism dimension is an independent degree. Set them individually
+in ParallelConfig and they compose via the DeviceMesh. The product of all
+degrees must equal num_workers.
+
+    | Dimension     | What it does                        | Communication        |
+    |---------------|-------------------------------------|----------------------|
+    | dp_replicate  | Gradient all-reduce (DDP)           | all-reduce           |
+    | dp_shard      | Parameter sharding (FSDP)           | all-gather + RS      |
+    | tp            | Weight sharding within a layer      | all-reduce per layer |
+
+Data parallelism mode is implicit from the degree values:
+
+    dp_shard>1, dp_replicate=1  → pure FSDP
+    dp_replicate>1, dp_shard=1  → pure DDP
+    dp_replicate>1, dp_shard>1  → HSDP (FSDP within shard group, DDP across)
+
+dp_shard=-1 (default) auto-fills with remaining ranks after other dimensions.
+
+Examples (8 GPUs):
+    ParallelConfig(num_workers=8)                         → FSDP(8)
+    ParallelConfig(dp_replicate=8, dp_shard=1, nw=8)      → DDP(8)
+    ParallelConfig(dp_replicate=2, nw=8)                  → HSDP: FSDP(4) × DDP(2)
+    ParallelConfig(tp_size=2, nw=8)                       → FSDP(4) × TP(2)
+    ParallelConfig(dp_replicate=2, tp_size=2, nw=8)       → HSDP: FSDP(2) × DDP(2) × TP(2)
+
+Mesh layout: [dp_replicate, dp_shard, tp] — TP innermost (NVLink), DP outermost.
+
+Application order:
+    1. TP (shard weights, replace forwards)
+    2. FSDP (parameter sharding — includes HSDP when dp_replicate>1)
+    3. DDP (gradient all-reduce)
+Each step operates on the model produced by the previous one.
 """
 
 import logging
-import os
 
 import torch
 import torch.distributed as dist
 
 from nanigpt.config import ParallelConfig
-from nanigpt.distributed.data_parallel import apply_data_parallelism
+from nanigpt.distributed.data_parallel import apply_ddp, apply_fsdp
 from nanigpt.distributed.mesh import create_device_mesh
-from nanigpt.distributed.plan import ParallelPlan
+from nanigpt.env import MASTER_ADDR, MASTER_PORT
 
 __all__ = [
     "apply_parallelism",
@@ -35,7 +57,6 @@ __all__ = [
     "get_world_size",
     "init_distributed",
     "is_rank_zero",
-    "ParallelPlan",
 ]
 
 log = logging.getLogger("distributed")
@@ -50,8 +71,13 @@ def init_distributed(rank: int, world_size: int, backend: str = "nccl") -> None:
     Expects MASTER_ADDR and MASTER_PORT to already be set in the environment.
     Each rank should see a single GPU via CUDA_VISIBLE_DEVICES (Ray handles this).
     """
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29500")
+    MASTER_ADDR.set_default(MASTER_ADDR.default)
+    MASTER_PORT.set_default(MASTER_PORT.default)
+
+    if rank == 0:
+        log.info(
+            f"MASTER_ADDR={MASTER_ADDR.get_value()}, MASTER_PORT={MASTER_PORT.get_value()}"
+        )
 
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     torch.cuda.set_device(0)  # Each worker sees only its own GPU
@@ -98,9 +124,35 @@ def apply_parallelism(
     This is the single entry point for train.py — it handles mesh creation
     and strategy dispatch so the training loop doesn't need to know the details.
 
-    Currently supports DDP and FSDP. When TP/PP are added, this function
-    will read additional fields from ParallelConfig to build a multi-dimensional
-    mesh and apply strategies in the right order (TP first, then DP).
+    Application order (matches docstring at top of module):
+        1. TP — shard weights, replace forwards
+        2. FSDP — parameter sharding (includes HSDP when dp_replicate>1)
+        3. DDP — gradient all-reduce
     """
-    mesh = create_device_mesh(world_size)
-    return apply_data_parallelism(model, mesh, config.plan)
+    mesh = create_device_mesh(
+        world_size,
+        dp_replicate=config.dp_replicate,
+        dp_shard=config.dp_shard,
+        tp_size=config.tp_size,
+    )
+
+    # 1. TP: shard weights, replace forwards
+    if config.tp_size > 1:
+        from nanigpt.distributed.tensor_parallel import apply_tensor_parallelism
+
+        apply_tensor_parallelism(model, mesh)
+
+    # 2. FSDP: parameter sharding (2D mesh for HSDP when dp_replicate>1)
+    if config.dp_shard > 1:
+        apply_fsdp(model, mesh)
+
+    # 3. DDP: gradient all-reduce (only when no FSDP — HSDP handles replicate via FSDP's 2D mesh)
+    if config.dp_replicate > 1 and config.dp_shard <= 1:
+        if config.tp_size > 1:
+            raise ValueError(
+                "DDP + TP is not supported — use FSDP + TP instead (dp_shard > 1). "
+                "FSDP gives the same gradient sync with better memory efficiency."
+            )
+        apply_ddp(model, mesh)
+
+    return model

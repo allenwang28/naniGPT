@@ -138,7 +138,7 @@ class MultiHeadAttention(nn.Module):
             dropout_p=self.attn_dropout.p if self.training else 0.0,
         )
 
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, self.n_heads * self.d_head)
         return self.resid_dropout(self.out_proj(attn_out))
 
 

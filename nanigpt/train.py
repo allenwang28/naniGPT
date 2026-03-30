@@ -343,7 +343,7 @@ def main():
     config = parse_config()
     config.validate()
 
-    if config.parallel.plan == "none":
+    if config.parallel.num_workers == 1:
         # Single-GPU: run directly
         train_worker(0, 1, config)
     else:

@@ -3,22 +3,40 @@
 The plan is a data description — it doesn't do any work. Mesh creation,
 model wrapping, and weight sharding read the plan to decide what to do.
 
-Current: DDP and FSDP only (dp_strategy).
-Future: tp_size, pp_size, ep_size, cp_size, sequence_parallel, tp_plan, expert_plan.
+Each dimension is an independent degree. The product of all degrees must
+equal world_size. Dimensions with degree 1 are inactive (no communication).
+
+    | Dimension     | What it does                        | Communication     |
+    |---------------|-------------------------------------|-------------------|
+    | dp_replicate  | Gradient all-reduce (DDP)           | all-reduce        |
+    | dp_shard      | Parameter sharding (FSDP)           | all-gather + RS   |
+    | tp            | Weight sharding within a layer      | all-reduce per layer |
+    | pp            | (future) Pipeline stages            | point-to-point    |
+    | ep            | (future) Expert routing             | all-to-all        |
+    | cp            | (future) Context/sequence parallel  | ring attention    |
+
+Composition examples (8 GPUs):
+    dp_shard=8                           → pure FSDP
+    dp_replicate=8                       → pure DDP
+    dp_replicate=4, dp_shard=2           → HSDP
+    dp_shard=4, tp=2                     → FSDP + TP
+    dp_replicate=2, dp_shard=2, tp=2     → HSDP + TP
+
+Future: pp_size, ep_size, cp_size.
 """
 
 from dataclasses import dataclass
-from typing import Literal
 
 
 @dataclass(kw_only=True, slots=True)
 class ParallelPlan:
     """Declares the parallelism strategy for a training run.
 
-    For now this only covers data parallelism. As TP/PP/EP are added,
-    the plan grows to include tp_size, pp_size, ep_size, and sub-plans
-    like TensorParallelPlan and ExpertParallelPlan.
+    dp_replicate: DDP degree (gradient all-reduce). 1 = disabled.
+    dp_shard: FSDP degree (parameter sharding). 1 = disabled.
+    tp_size: Tensor parallel degree. Must divide n_heads and d_ff. 1 = disabled.
     """
 
-    dp_strategy: Literal["ddp", "fsdp"] = "fsdp"
-    """Data parallelism strategy."""
+    dp_replicate: int = 1
+    dp_shard: int = 1
+    tp_size: int = 1
