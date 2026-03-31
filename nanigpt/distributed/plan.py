@@ -40,3 +40,16 @@ class ParallelPlan:
     dp_replicate: int = 1
     dp_shard: int = 1
     tp_size: int = 1
+
+    def degree_for(self, mesh_dim: str) -> int:
+        """Return the parallelism degree for a named mesh dimension.
+
+        Maps mesh dimension names (as used in DeviceMesh and ModuleSharding)
+        to the corresponding plan field. Unknown dimensions return 1.
+        """
+        _MESH_DIM_TO_FIELD = {
+            "tp": self.tp_size,
+            "dp_shard": self.dp_shard,
+            "dp_replicate": self.dp_replicate,
+        }
+        return _MESH_DIM_TO_FIELD.get(mesh_dim, 1)

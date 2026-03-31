@@ -47,6 +47,7 @@ import torch.distributed as dist
 from nanigpt.config import ParallelConfig
 from nanigpt.distributed.data_parallel import apply_ddp, apply_fsdp
 from nanigpt.distributed.mesh import create_device_mesh
+from nanigpt.distributed.plan import ParallelPlan
 from nanigpt.env import MASTER_ADDR, MASTER_PORT
 
 __all__ = [
@@ -75,9 +76,7 @@ def init_distributed(rank: int, world_size: int, backend: str = "nccl") -> None:
     MASTER_PORT.set_default(MASTER_PORT.default)
 
     if rank == 0:
-        log.info(
-            f"MASTER_ADDR={MASTER_ADDR.get_value()}, MASTER_PORT={MASTER_PORT.get_value()}"
-        )
+        log.info(f"MASTER_ADDR={MASTER_ADDR.get_value()}, MASTER_PORT={MASTER_PORT.get_value()}")
 
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     torch.cuda.set_device(0)  # Each worker sees only its own GPU
@@ -129,30 +128,36 @@ def apply_parallelism(
         2. FSDP — parameter sharding (includes HSDP when dp_replicate>1)
         3. DDP — gradient all-reduce
     """
-    mesh = create_device_mesh(
-        world_size,
+    plan = ParallelPlan(
         dp_replicate=config.dp_replicate,
         dp_shard=config.dp_shard,
         tp_size=config.tp_size,
     )
 
+    mesh = create_device_mesh(
+        world_size,
+        dp_replicate=plan.dp_replicate,
+        dp_shard=plan.dp_shard,
+        tp_size=plan.tp_size,
+    )
+
     # 1. TP: shard weights, replace forwards
-    if config.tp_size > 1:
+    if plan.tp_size > 1:
         from nanigpt.distributed.tensor_parallel import apply_tensor_parallelism
 
-        apply_tensor_parallelism(model, mesh)
+        apply_tensor_parallelism(model, plan, mesh)
 
     # 2. FSDP: parameter sharding (2D mesh for HSDP when dp_replicate>1)
-    if config.dp_shard > 1:
-        apply_fsdp(model, mesh)
+    if plan.dp_shard > 1:
+        apply_fsdp(model, plan, mesh)
 
     # 3. DDP: gradient all-reduce (only when no FSDP — HSDP handles replicate via FSDP's 2D mesh)
-    if config.dp_replicate > 1 and config.dp_shard <= 1:
-        if config.tp_size > 1:
+    if plan.dp_replicate > 1 and plan.dp_shard <= 1:
+        if plan.tp_size > 1:
             raise ValueError(
                 "DDP + TP is not supported — use FSDP + TP instead (dp_shard > 1). "
                 "FSDP gives the same gradient sync with better memory efficiency."
             )
-        apply_ddp(model, mesh)
+        apply_ddp(model, plan, mesh)
 
     return model

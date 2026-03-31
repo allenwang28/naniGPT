@@ -12,10 +12,12 @@ import logging
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 
+from nanigpt.distributed.plan import ParallelPlan
+
 log = logging.getLogger("distributed.data_parallel")
 
 
-def apply_fsdp(model: nn.Module, mesh: DeviceMesh) -> nn.Module:
+def apply_fsdp(model: nn.Module, plan: ParallelPlan, mesh: DeviceMesh) -> nn.Module:
     """Apply FSDP2 via fully_shard.
 
     Shards each TransformerBlock individually, then the root model.
@@ -51,7 +53,7 @@ def apply_fsdp(model: nn.Module, mesh: DeviceMesh) -> nn.Module:
     return model
 
 
-def apply_ddp(model: nn.Module, mesh: DeviceMesh) -> nn.Module:
+def apply_ddp(model: nn.Module, plan: ParallelPlan, mesh: DeviceMesh) -> nn.Module:
     """Apply composable DDP via DTensor-based replicate."""
     from torch.distributed._composable.replicate import replicate
 

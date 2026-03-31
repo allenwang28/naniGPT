@@ -1,36 +1,65 @@
 """Tests for tensor parallelism (nanigpt/distributed/tensor_parallel.py).
 
-Unit tests verify weight sharding shapes and the TP plan. Multi-GPU tests
-verify numerical equivalence between single-GPU and TP=2 forward/backward.
+Unit tests verify the registry-based sharding plan and weight sharding shapes.
+Multi-GPU tests verify numerical equivalence between single-GPU and TP=2
+forward/backward.
 """
 
-from nanigpt.distributed.tensor_parallel import DEFAULT_TP_STYLE
+import torch
+
+from nanigpt.distributed.plan import ParallelPlan
+from nanigpt.distributed.registry import resolve_sharding
+from nanigpt.distributed.sharding import colwise, rowwise
+from nanigpt.models.dense_transformer import DenseTransformer, TransformerConfig
 from tests.distributed_utils import distributed_test
 
 # ---- Unit tests (no GPU required) ----
 
 
-def test_default_tp_style_keys():
-    """DEFAULT_TP_STYLE should cover all expected linear layers."""
-    expected_keys = {
-        "attn.q_proj",
-        "attn.k_proj",
-        "attn.v_proj",
-        "attn.out_proj",
-        "ffn.up",
-        "ffn.down",
+def test_tp_plan_covers_all_linear_layers():
+    """The registry should produce sharding entries for all expected linear layers."""
+    with torch.device("meta"):
+        config = TransformerConfig(
+            vocab_size=256, d_model=64, n_heads=4, n_layers=1, d_ff=128, max_seq_len=32
+        )
+        model = DenseTransformer(config)
+
+    plan = ParallelPlan(tp_size=2)
+    sharding_plan = resolve_sharding(model, plan)
+
+    fqns = {
+        f"{e.parent_fqn}.{e.child_name}" if e.parent_fqn else e.child_name
+        for e in sharding_plan.entries
     }
-    assert set(DEFAULT_TP_STYLE.keys()) == expected_keys
+    expected = {
+        "blocks.0.attn.q_proj",
+        "blocks.0.attn.k_proj",
+        "blocks.0.attn.v_proj",
+        "blocks.0.attn.out_proj",
+        "blocks.0.ffn.up",
+        "blocks.0.ffn.down",
+    }
+    assert expected == fqns
 
 
-def test_default_tp_style_values():
+def test_tp_plan_colwise_rowwise_assignment():
     """Colwise for Q/K/V/up, rowwise for out_proj/down."""
-    assert DEFAULT_TP_STYLE["attn.q_proj"] == "colwise"
-    assert DEFAULT_TP_STYLE["attn.k_proj"] == "colwise"
-    assert DEFAULT_TP_STYLE["attn.v_proj"] == "colwise"
-    assert DEFAULT_TP_STYLE["attn.out_proj"] == "rowwise"
-    assert DEFAULT_TP_STYLE["ffn.up"] == "colwise"
-    assert DEFAULT_TP_STYLE["ffn.down"] == "rowwise"
+    with torch.device("meta"):
+        config = TransformerConfig(
+            vocab_size=256, d_model=64, n_heads=4, n_layers=1, d_ff=128, max_seq_len=32
+        )
+        model = DenseTransformer(config)
+
+    plan = ParallelPlan(tp_size=2)
+    sharding_plan = resolve_sharding(model, plan)
+
+    by_child = {e.child_name: e.sharding for e in sharding_plan.entries}
+    assert by_child["q_proj"] == colwise("tp")
+    assert by_child["k_proj"] == colwise("tp")
+    assert by_child["v_proj"] == colwise("tp")
+    assert by_child["out_proj"] == rowwise("tp")
+    assert by_child["up"] == colwise("tp")
+    assert by_child["down"] == rowwise("tp")
 
 
 # ---- Multi-GPU tests ----
@@ -89,7 +118,8 @@ def test_apply_tp_shards_all_modules(rank, world_size):
     model = DenseTransformer(config).cuda()
 
     mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("tp",))
-    apply_tensor_parallelism(model, mesh)
+    plan = ParallelPlan(tp_size=world_size)
+    apply_tensor_parallelism(model, plan, mesh)
 
     for block in model.blocks:
         # Colwise: output dim halved
@@ -147,7 +177,8 @@ def test_tp_numerical_equivalence(rank, world_size):
     tp_model = DenseTransformer(config).cuda()
 
     mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("tp",))
-    apply_tensor_parallelism(tp_model, mesh)
+    plan = ParallelPlan(tp_size=world_size)
+    apply_tensor_parallelism(tp_model, plan, mesh)
 
     tp_output = tp_model(input_ids)
     tp_loss = F.cross_entropy(
@@ -184,7 +215,8 @@ def test_tp_backward_runs(rank, world_size):
 
     model = DenseTransformer(config).cuda()
     mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("tp",))
-    apply_tensor_parallelism(model, mesh)
+    plan = ParallelPlan(tp_size=world_size)
+    apply_tensor_parallelism(model, plan, mesh)
 
     torch.manual_seed(123)
     input_ids = torch.randint(0, 256, (2, 16), device="cuda")

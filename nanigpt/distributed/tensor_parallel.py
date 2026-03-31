@@ -4,6 +4,10 @@ The model stays a standard nn.Module with nn.Linear layers. TP is applied
 externally by sharding weights and replacing forward methods with closures
 that call the comm primitives from comm.py.
 
+This module owns the TP application layer: slicing weights and installing
+comm-aware forwards. Resolution (deciding *what* to shard) lives in
+registry.py and is TP-agnostic.
+
 Data flow through a TP transformer layer (no sequence parallelism):
 
     Input x: [B, S, H]                           SPMD: I@tp
@@ -35,7 +39,6 @@ Data flow through a TP transformer layer (no sequence parallelism):
 """
 
 import logging
-from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -48,20 +51,12 @@ from nanigpt.distributed.comm import (
     enter_parallel_region,
     exit_parallel_region,
 )
+from nanigpt.distributed.plan import ParallelPlan
+from nanigpt.distributed.registry import ShardingPlan, resolve_sharding
+from nanigpt.distributed.sharding import Shard
 from nanigpt.distributed.spmd import SPMDType, assert_type, spmd_checks_enabled
 
 log = logging.getLogger(__name__)
-
-# Default TP plan for DenseTransformer. Keys are module name suffixes
-# matched against named_modules(). Values are "colwise" or "rowwise".
-DEFAULT_TP_STYLE: dict[str, Literal["colwise", "rowwise"]] = {
-    "attn.q_proj": "colwise",
-    "attn.k_proj": "colwise",
-    "attn.v_proj": "colwise",
-    "attn.out_proj": "rowwise",
-    "ffn.up": "colwise",
-    "ffn.down": "rowwise",
-}
 
 
 def column_parallel_linear(
@@ -176,18 +171,77 @@ def _shard_linear_rowwise(
     linear.forward = forward
 
 
+def apply_sharding(
+    model: nn.Module,
+    sharding_plan: ShardingPlan,
+    mesh: DeviceMesh,
+) -> None:
+    """Execute a resolved sharding plan: slice weights and replace forwards.
+
+    This is the execution step — it mutates the model in-place. The resolution
+    step (resolve_sharding) has already decided what to shard and how.
+
+    Args:
+        model: Pure nn.Module, must already be on device.
+        sharding_plan: Output of resolve_sharding().
+        mesh: DeviceMesh with a "tp" dimension.
+    """
+    tp_mesh = mesh["tp"]
+    tp_rank = tp_mesh.get_local_rank()
+    tp_size = tp_mesh.size()
+    group = tp_mesh.get_group()
+
+    module_dict = dict(model.named_modules())
+
+    for entry in sharding_plan.entries:
+        fqn = f"{entry.parent_fqn}.{entry.child_name}" if entry.parent_fqn else entry.child_name
+        child = module_dict.get(fqn)
+        if child is None or not isinstance(child, nn.Linear):
+            log.warning(f"Skipping {fqn}: not found or not nn.Linear")
+            continue
+
+        weight_placements = entry.sharding.params.get("weight", {})
+        tp_placement = weight_placements.get("tp")
+
+        if isinstance(tp_placement, Shard) and tp_placement.dim == 0:
+            if child.out_features % tp_size != 0:
+                raise ValueError(
+                    f"{fqn}: out_features ({child.out_features}) "
+                    f"not divisible by tp_size ({tp_size})"
+                )
+            _shard_linear_colwise(child, tp_rank, tp_size, group)
+        elif isinstance(tp_placement, Shard) and tp_placement.dim == 1:
+            if child.in_features % tp_size != 0:
+                raise ValueError(
+                    f"{fqn}: in_features ({child.in_features}) not divisible by tp_size ({tp_size})"
+                )
+            _shard_linear_rowwise(child, tp_rank, tp_size, group)
+
+    # Apply attribute adjustments (e.g. n_heads for attention)
+    for parent_fqn, adjustments in sharding_plan.adjustments.items():
+        parent = module_dict.get(parent_fqn)
+        if parent is None:
+            log.warning(f"Skipping adjustment for {parent_fqn}: not found")
+            continue
+        for attr, value in adjustments.items():
+            setattr(parent, attr, value)
+
+
 def apply_tensor_parallelism(
     model: nn.Module,
+    plan: ParallelPlan,
     mesh: DeviceMesh,
 ) -> nn.Module:
-    """Apply tensor parallelism to a model using the default TP plan.
+    """Apply tensor parallelism to a model using the type-based registry.
 
-    Walks the model's named modules, matches against DEFAULT_TP_STYLE,
-    shards weights, and replaces forward methods. Also adjusts attention
-    head counts for the local shard.
+    Resolution is separated from execution:
+    1. resolve_sharding() walks the model and dispatches on module type
+       to decide what gets sharded and how (pure, no side effects).
+    2. apply_sharding() slices weights and replaces forward methods.
 
     Args:
         model: Pure nn.Module (e.g. DenseTransformer). Must already be on device.
+        plan: ParallelPlan with all parallelism degrees.
         mesh: DeviceMesh with a "tp" dimension.
 
     Returns:
@@ -196,63 +250,21 @@ def apply_tensor_parallelism(
     tp_mesh = mesh["tp"]
     tp_rank = tp_mesh.get_local_rank()
     tp_size = tp_mesh.size()
-    group = tp_mesh.get_group()
 
     if tp_size == 1:
         log.info("TP size is 1, skipping tensor parallelism")
         return model
 
-    # Validate model dimensions are divisible by tp_size
-    from nanigpt.models.dense_transformer import MultiHeadAttention
+    # Resolve: decide what to shard (pure, no side effects)
+    sharding_plan = resolve_sharding(model, plan)
 
-    # (name, style, shape_before, shape_after) for logging
-    sharded: list[tuple[str, str, str, str]] = []
+    # Log the plan before execution (rank 0 only)
+    if tp_rank == 0 and sharding_plan.entries:
+        table = sharding_plan.format_table(model, plan)
+        n = len(sharding_plan.entries)
+        log.info(f"Sharding plan (tp_size={tp_size}, {n} modules):\n{table}")
 
-    for name, module in model.named_modules():
-        # Check if this module matches any TP style
-        for suffix, style in DEFAULT_TP_STYLE.items():
-            if name.endswith(suffix) and isinstance(module, nn.Linear):
-                shape_before = f"[{module.out_features}, {module.in_features}]"
-                if style == "colwise":
-                    if module.out_features % tp_size != 0:
-                        raise ValueError(
-                            f"{name}: out_features ({module.out_features}) "
-                            f"not divisible by tp_size ({tp_size})"
-                        )
-                    _shard_linear_colwise(module, tp_rank, tp_size, group)
-                elif style == "rowwise":
-                    if module.in_features % tp_size != 0:
-                        raise ValueError(
-                            f"{name}: in_features ({module.in_features}) "
-                            f"not divisible by tp_size ({tp_size})"
-                        )
-                    _shard_linear_rowwise(module, tp_rank, tp_size, group)
-                shape_after = f"[{module.out_features}, {module.in_features}]"
-                sharded.append((name, style, shape_before, shape_after))
-                break
+    # Execute: slice weights, replace forwards, apply adjustments
+    apply_sharding(model, sharding_plan, mesh)
 
-        # Adjust attention head count for TP
-        if isinstance(module, MultiHeadAttention):
-            if module.n_heads % tp_size != 0:
-                raise ValueError(
-                    f"{name}: n_heads ({module.n_heads}) not divisible by tp_size ({tp_size})"
-                )
-            module.n_heads = module.n_heads // tp_size
-
-    # Pretty-print the sharding plan (rank 0 only to avoid duplicate spam)
-    if tp_rank == 0:
-        name_w = max(len(n) for n, _, _, _ in sharded)
-        style_w = max(len(s) for _, s, _, _ in sharded)
-        before_w = max(len(b) for _, _, b, _ in sharded)
-        header = f"  {'module':<{name_w}}  {'style':<{style_w}}  {'before':<{before_w}}  after"
-        sep = f"  {'-' * name_w}  {'-' * style_w}  {'-' * before_w}  -----"
-        rows = "\n".join(
-            f"  {name:<{name_w}}  {style:<{style_w}}  {before:<{before_w}}  {after}"
-            for name, style, before, after in sharded
-        )
-        log.info(
-            f"Applied tensor parallelism (tp_size={tp_size}, {len(sharded)} modules):\n"
-            f"{header}\n{sep}\n{rows}"
-        )
     return model
-

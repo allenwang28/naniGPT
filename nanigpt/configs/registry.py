@@ -81,6 +81,13 @@ def medium_fineweb_fsdp() -> TrainConfig:
     return config
 
 
+def medium_fineweb_tp() -> TrainConfig:
+    """Medium model on real data with TP on 8 GPUs."""
+    config = medium_fineweb()
+    config.parallel = ParallelConfig(tp_size=8, num_workers=8)
+    return config
+
+
 # ---- Registry map ----
 
 REGISTRY: dict[str, Callable[[], TrainConfig]] = {
@@ -89,6 +96,7 @@ REGISTRY: dict[str, Callable[[], TrainConfig]] = {
     "small-synthetic-long": small_synthetic_long,
     "medium-fineweb": medium_fineweb,
     "medium-fineweb-fsdp": medium_fineweb_fsdp,
+    "medium-fineweb-tp": medium_fineweb_tp,
     "small-synthetic-ddp": small_synthetic_ddp,
     "small-synthetic-fsdp": small_synthetic_fsdp,
     "small-synthetic-tp": small_synthetic_tp,

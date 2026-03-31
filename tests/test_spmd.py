@@ -184,4 +184,3 @@ def test_gather_output_is_replicate(rank, world_size):
     x = torch.ones(4, 8, device="cuda") * (rank + 1)
     y = gather_into_parallel_region(x, group)
     assert_type(y, SPMDType.REPLICATE, group)
-
