@@ -116,3 +116,7 @@ This downloads from `HuggingFaceFW/fineweb-edu`, tokenizes with GPT-2's tokenize
 - **Use f-strings for formatting.** Prefer `f"step {step}"` over `"step %d" % step` or `"step {}".format(step)`. This applies everywhere including `logging` calls — use `log.info(f"step {step}")` not `log.info("step %d", step)`.
 - **No directory structure trees in docstrings.** They go stale immediately as files are added/renamed. The filesystem *is* the directory structure — use `ls` or your editor. Docstrings should explain *how things work*, not *what files exist*.
 - **Megatron-derived code is renamed for readability.** When adapting from Megatron, use our names (e.g. `enter/exit_parallel_region` not `CopyTo/ReduceFrom`). The original-to-ours mapping lives in the relevant module's docstring.
+
+## Specs
+
+`docs/specs/` contains structured reference docs — one per subsystem, mirroring the code structure (`docs/specs/distributed/` → `nanigpt/distributed/`). Read the spec *before* opening source files. Each spec has four sections: **Overview**, **Key Files**, **Invariants** (correctness rules — the most valuable part), and **Design Decisions**. Specs are updated in place, unlike journal entries which are append-only. See `journal/specs/2026-03-30-introducing-specs.md` for the full rationale.
