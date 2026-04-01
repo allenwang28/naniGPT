@@ -116,6 +116,7 @@ This downloads from `HuggingFaceFW/fineweb-edu`, tokenizes with GPT-2's tokenize
 - **Use f-strings for formatting.** Prefer `f"step {step}"` over `"step %d" % step` or `"step {}".format(step)`. This applies everywhere including `logging` calls — use `log.info(f"step {step}")` not `log.info("step %d", step)`.
 - **No directory structure trees in docstrings.** They go stale immediately as files are added/renamed. The filesystem *is* the directory structure — use `ls` or your editor. Docstrings should explain *how things work*, not *what files exist*.
 - **Megatron-derived code is renamed for readability.** When adapting from Megatron, use our names (e.g. `enter/exit_parallel_region` not `CopyTo/ReduceFrom`). The original-to-ours mapping lives in the relevant module's docstring.
+- **Run an e2e workload before reporting done.** Unit tests passing is not sufficient — run an actual training config (e.g. `uv run python -m nanigpt.train --config small-synthetic`) to verify the change works in practice. Distributed changes should be tested with a multi-GPU config.
 
 ## Specs
 
