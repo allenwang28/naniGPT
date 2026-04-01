@@ -19,7 +19,7 @@ def small_synthetic() -> TrainConfig:
     return TrainConfig(
         model=MODEL_PRESETS["small"],
         data=SyntheticData.Config(seq_len=256, distribution="zipf"),
-        training=TrainingConfig(batch_size=32, lr=3e-4, num_steps=200),
+        training=TrainingConfig(batch_size=32, lr=3e-4, num_steps=50),
     )
 
 
