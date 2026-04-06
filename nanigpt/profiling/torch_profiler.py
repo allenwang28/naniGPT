@@ -26,6 +26,7 @@ Usage:
 """
 
 import logging
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -34,16 +35,9 @@ import torch.profiler
 from nanigpt.configurable import Configurable
 from nanigpt.profiling.context import get_step, unregister_step_end
 from nanigpt.profiling.perfetto import export_trace, serve_traces
+from nanigpt.profiling.trace_analysis import _is_comm_kernel, compute_exposed_comm
 
 log = logging.getLogger(__name__)
-
-
-_NCCL_PREFIXES = ("nccl", "ncclKernel", "ncclDevKernel")
-
-
-def _is_comm_kernel(name: str) -> bool:
-    """Return True if the kernel name is an NCCL communication op."""
-    return any(name.startswith(p) for p in _NCCL_PREFIXES)
 
 
 def _parse_windows(windows_str: str) -> list[tuple[int, int]]:
@@ -80,9 +74,27 @@ def _parse_windows(windows_str: str) -> list[tuple[int, int]]:
     return result
 
 
+def _print_comm_overhead(exposed: dict, steps_label: str = "") -> None:
+    """Format the communication overhead section from exposed comm analysis."""
+    total = exposed["total_comm_ms"]
+    blocking = exposed["exposed_comm_ms"]
+    hidden = exposed["hidden_comm_ms"]
+    n = exposed["num_nccl_kernels"]
+    blocking_pct = 100.0 * blocking / total if total > 0 else 0
+    hidden_pct = 100.0 * hidden / total if total > 0 else 0
+    if steps_label:
+        header = f"Communication overhead ({steps_label}):"
+    else:
+        header = "Communication overhead:"
+    log.info(header)
+    log.info(f"  Total NCCL time:          {total:7.2f} ms ({n} kernels)")
+    log.info(f"  Blocking compute:         {blocking:7.2f} ms ({blocking_pct:.0f}%)")
+    log.info(f"  Hidden behind compute:    {hidden:7.2f} ms ({hidden_pct:.0f}%)")
+    log.info("")
+
+
 def _print_kernel_table(averages: list, top_n: int, label: str = "") -> None:
-    """Format key_averages() as a terminal table sorted by self GPU time."""
-    # Filter to entries with non-zero self GPU time, sort descending
+    """Format key_averages() as a compact kernel table sorted by self GPU time."""
     gpu_entries = [e for e in averages if e.self_device_time_total > 0]
     gpu_entries.sort(key=lambda e: e.self_device_time_total, reverse=True)
 
@@ -94,34 +106,24 @@ def _print_kernel_table(averages: list, top_n: int, label: str = "") -> None:
         return
 
     total_gpu_us = sum(e.self_device_time_total for e in gpu_entries)
-    total_cpu_us = sum(e.self_cpu_time_total for e in averages)
 
     top = gpu_entries[:top_n]
     rest = gpu_entries[top_n:]
 
-    # Header
-    header = f"{'Kernel':<60} {'GPU%':>5} {'GPU ms':>8} {'CPU ms':>8} {'Calls':>6}"
-    if any(e.flops for e in top):
-        header += f" {'GFLOPS':>8}"
-    log.info(header)
-    log.info("-" * len(header))
-
     for e in top:
         gpu_pct = 100.0 * e.self_device_time_total / total_gpu_us if total_gpu_us else 0
         gpu_ms = e.self_device_time_total / 1000.0
-        cpu_ms = e.self_cpu_time_total / 1000.0
-        name = e.key[:60]
-        line = f"{name:<60} {gpu_pct:5.1f} {gpu_ms:8.02f} {cpu_ms:8.02f} {e.count:6d}"
+        name = e.key[:40]
+        line = f"  {name:<40s} {gpu_ms:7.2f} ms {gpu_pct:5.1f}%"
         if e.flops:
             gflops = e.flops / 1e9
-            line += f" {gflops:8.1f}"
+            line += f"  {gflops:.0f} GFLOPS"
         log.info(line)
 
-    # Summary for remaining ops
     if rest:
         rest_gpu_us = sum(e.self_device_time_total for e in rest)
         rest_pct = 100.0 * rest_gpu_us / total_gpu_us if total_gpu_us else 0
-        log.info(f"\033[2m... {len(rest)} more ops ({rest_pct:.1f}% of GPU time)\033[0m")
+        log.info(f"  ... {len(rest)} more ops ({rest_pct:.1f}% of GPU time)")
 
     # Compute vs communication breakdown
     comm_us = sum(e.self_device_time_total for e in gpu_entries if _is_comm_kernel(e.key))
@@ -130,14 +132,9 @@ def _print_kernel_table(averages: list, top_n: int, label: str = "") -> None:
         comm_pct = 100.0 * comm_us / total_gpu_us
         compute_pct = 100.0 * compute_us / total_gpu_us
         log.info(
-            f"Compute: {compute_us / 1000:.2f} ms ({compute_pct:.1f}%)"
+            f"  Compute: {compute_us / 1000:.2f} ms ({compute_pct:.1f}%)"
             f" | Communication: {comm_us / 1000:.2f} ms ({comm_pct:.1f}%)"
         )
-
-    # CPU/GPU ratio as launch overhead indicator
-    if total_gpu_us > 0:
-        ratio = total_cpu_us / total_gpu_us
-        log.info(f"\033[2mCPU/GPU time ratio: {ratio:.2f}x\033[0m")
 
 
 @dataclass
@@ -199,7 +196,7 @@ class TorchProfiler(Configurable):
 
     def __init__(self, config: Config):
         self._config = config
-        self._results: list[tuple[list, int, str]] = []
+        self._results: list[tuple[list, int, str, dict | None]] = []
         self._trace_paths: list[Path] = []
 
         if not config.enabled:
@@ -223,8 +220,9 @@ class TorchProfiler(Configurable):
 
             def make_on_trace_ready(ws: int, we: int, td: Path):
                 def on_trace_ready(p: torch.profiler.profile) -> None:
-                    label = f"Window steps {ws}-{we}:"
-                    self._results.append((p.key_averages(), config.top_n, label))
+                    label = f"Top kernels (steps {ws}-{we}):"
+                    exposed = compute_exposed_comm(p)
+                    self._results.append((p.key_averages(), config.top_n, label, exposed))
                     if config.export_trace:
                         gz_path = export_trace(p, ws, we, td)
                         self._trace_paths.append(gz_path)
@@ -284,8 +282,13 @@ class TorchProfiler(Configurable):
             unregister_step_end(self)
 
     def print_summary(self) -> None:
-        """Print the kernel table for each window. Call at end of training."""
-        for averages, top_n, label in self._results:
+        """Print exposed comm analysis and kernel table for each window."""
+        for averages, top_n, label, exposed in self._results:
+            if exposed is not None:
+                # Extract "steps X-Y" from label like "Top kernels (steps 10-12):"
+                m = re.search(r"steps (\d+-\d+)", label)
+                steps_label = f"steps {m.group(1)}" if m else ""
+                _print_comm_overhead(exposed, steps_label)
             _print_kernel_table(averages, top_n, label=label)
 
     def serve_perfetto(self) -> None:

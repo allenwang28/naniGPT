@@ -98,6 +98,7 @@ class ParallelConfig:
     tp_size: int = 1
     num_workers: int = 1
     backend: str = "nccl"
+    comm_timing: bool = True
 
     def __post_init__(self):
         # Auto-fill dp_shard with remaining ranks

@@ -69,10 +69,20 @@ MASTER_PORT = EnvVar(
 SPMD_CHECKS = EnvVar(
     name="NANIGPT_SPMD_CHECKS",
     default=False,
-    description="Enable runtime SPMD type verification (broadcasts rank 0's tensor and compares). Adds sync points — use for debugging, not training.",
+    description=(
+        "Enable runtime SPMD type verification"
+        " (broadcasts rank 0's tensor and compares)."
+        " Adds sync points — use for debugging, not training."
+    ),
 )
 
 
 def all_env_vars() -> list[EnvVar]:
     """Return all registered EnvVar instances in this module."""
     return [v for v in globals().values() if isinstance(v, EnvVar)]
+
+
+def enforce_defaults() -> None:
+    """Set defaults for all env vars that haven't been explicitly set."""
+    for var in all_env_vars():
+        var.set_default(var.default)

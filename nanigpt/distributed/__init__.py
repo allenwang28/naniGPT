@@ -43,6 +43,7 @@ import logging
 
 import torch
 import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
 
 from nanigpt.config import ParallelConfig
 from nanigpt.distributed.data_parallel import apply_ddp, apply_fsdp
@@ -72,9 +73,6 @@ def init_distributed(rank: int, world_size: int, backend: str = "nccl") -> None:
     Expects MASTER_ADDR and MASTER_PORT to already be set in the environment.
     Each rank should see a single GPU via CUDA_VISIBLE_DEVICES (Ray handles this).
     """
-    MASTER_ADDR.set_default(MASTER_ADDR.default)
-    MASTER_PORT.set_default(MASTER_PORT.default)
-
     if rank == 0:
         log.info(f"MASTER_ADDR={MASTER_ADDR.get_value()}, MASTER_PORT={MASTER_PORT.get_value()}")
 
@@ -160,4 +158,21 @@ def apply_parallelism(
             )
         apply_ddp(model, plan, mesh)
 
+    if config.comm_timing:
+        enable_comm_timing(mesh)
+
     return model
+
+
+def enable_comm_timing(mesh: DeviceMesh) -> None:
+    """Enable CUDA event timing on all NaniProcessGroups in the mesh."""
+    from nanigpt.distributed.mesh import get_process_group
+    from nanigpt.distributed.process_group import NaniProcessGroup
+
+    for dim_name in mesh._mesh_dim_names:
+        pg = get_process_group(mesh, dim_name)
+        if isinstance(pg, NaniProcessGroup):
+            pg.enable_comm_timing()
+            log.info(f"CommTiming: enabled for {dim_name}")
+        else:
+            log.warning(f"CommTiming: {dim_name} PG is {type(pg).__name__}, cannot enable timing")

@@ -1,38 +1,28 @@
-"""GPU-accurate timing for training regions.
+"""GPU-accurate timing for training steps.
 
-Architecture:
+StepMetrics is the central collector. Timing sources stash data during a
+step; StepMetrics.step() resolves everything at the step boundary and
+moves it into history.
 
-    measure (context manager)
-      → CUDATimer (records CUDA events on a stream)
-        → background thread (polls event.query() for completion)
-      → StepMetrics (collects resolved timings per step)
+Current timing sources:
 
-The key constraint: CUDA event timing requires both events to have completed
-before calling elapsed_time(), but calling event.synchronize() blocks the CPU
-and can stall the GPU pipeline. We avoid this by polling event.query() in a
-background daemon thread. By the time StepMetrics.step() runs at the step
-boundary, the polling threads have almost always finished — so joining them
-is effectively free.
+    1. CUDATimer / measure — CUDA events on the compute stream, resolved
+       via background polling (no CPU sync). Used for forward, backward,
+       optimizer, etc.
 
-Data flow for a single timed region:
+    2. CUDA event pairs (via NaniProcessGroup) — recorded around each
+       collective dispatch, resolved via start.elapsed_time(end).
+       Measures how long the compute stream is occupied by each collective.
+       Used for per-parallelism comm breakdown (TP, FSDP, DDP).
 
-    1. measure.__enter__  → CUDATimer.record_start() inserts a start marker
-                            into the GPU stream
-    2. (GPU work happens)
-    3. measure.__exit__   → CUDATimer.record_end() inserts an end marker and
-                            spawns a daemon thread that polls end_event.query()
-                          → StepMetrics.record_pending() stashes the timer
-    4. step_context exit  → StepMetrics.step() joins each timer's thread,
-                            reads elapsed_ms(), and moves timings into history
-
-The stream parameter on measure/CUDATimer defaults to the current stream but
-can be overridden for timing work on non-default streams.
+New timing sources plug in by adding a stash method + resolution in step().
 """
 
 import logging
 import threading
 import time
 from contextlib import ContextDecorator
+from dataclasses import dataclass
 
 import torch
 
@@ -91,19 +81,34 @@ class CUDATimer:
 class StepMetrics:
     """Accumulates region timings per step and provides reporting.
 
-    Regions are stashed as pending (event_type, CUDATimer) pairs during the step.
-    On step(), pending timers are resolved (joining their background threads)
-    and timings are moved into history.
+    Two sources of timing data:
+    1. CUDATimer (via record_pending): for compute regions timed on the
+       current CUDA stream. Resolved by joining background polling threads.
+    2. CUDA event pairs (via record_events): for comm collectives timed by
+       NaniProcessGroup. Resolved via start.elapsed_time(end).
+
+    On step(), both sources are resolved and timings are moved into history.
     """
 
     def __init__(self):
         self._pending: list[tuple[EventType, CUDATimer]] = []
+        # (type, start, end)
+        self._pending_events: list[tuple[EventType, torch.cuda.Event, torch.cuda.Event]] = []
         self._current: dict[str, float] = {}
         self._history: list[dict[str, float]] = []
 
     def record_pending(self, event_type: EventType, timer: CUDATimer) -> None:
         """Stash a timer for resolution at step boundary."""
         self._pending.append((event_type, timer))
+
+    def record_events(
+        self,
+        event_type: EventType,
+        start: torch.cuda.Event,
+        end: torch.cuda.Event,
+    ) -> None:
+        """Stash a CUDA event pair for resolution at step boundary."""
+        self._pending_events.append((event_type, start, end))
 
     def record(self, event_type: EventType, elapsed_ms: float) -> None:
         """Record a region's elapsed time directly (for testing or CPU timing)."""
@@ -112,11 +117,20 @@ class StepMetrics:
 
     def step(self) -> None:
         """Finalize the current step: resolve pending timers and move into history."""
+        # Resolve CUDATimer-based regions
         for event_type, timer in self._pending:
             elapsed = timer.elapsed_ms()
             key = event_type.value
             self._current[key] = self._current.get(key, 0.0) + elapsed
         self._pending.clear()
+
+        # Resolve CUDA event pairs (from CommTimer)
+        for event_type, start, end in self._pending_events:
+            end.synchronize()
+            elapsed = start.elapsed_time(end)
+            key = event_type.value
+            self._current[key] = self._current.get(key, 0.0) + elapsed
+        self._pending_events.clear()
 
         self._history.append(dict(self._current))
         self._current.clear()
@@ -162,6 +176,98 @@ class StepMetrics:
 
         lines.append(f"  {'total':>12s}: {total:7.2f} ms")
         return "\n".join(lines)
+
+
+_PHASE_ORDER = [
+    EventType.FORWARD,
+    EventType.BACKWARD,
+    EventType.OPTIMIZER,
+    EventType.DATA,
+]
+
+_COMM_ORDER = [EventType.TP_COMM, EventType.FSDP_COMM, EventType.DP_COMM]
+_COMM_DISPLAY = {"tp_comm": "tp", "fsdp_comm": "fsdp", "dp_comm": "dp"}
+
+
+@dataclass(slots=True)
+class StepTimings:
+    """Structured timings for a single step (or averaged across steps).
+
+    Separates compute phases (which determine step duration) from
+    communication volume (overlapped with compute).
+    """
+
+    step_timings: dict[str, float]
+    """Compute phase breakdown: forward, backward, optimizer, data, etc."""
+
+    comm_timings: dict[str, float]
+    """Communication volume per parallelism dimension (overlapped with compute)."""
+
+    @property
+    def step_ms(self) -> float:
+        """Total step duration (compute phases only, excludes comm)."""
+        return sum(self.step_timings.values())
+
+    def phase_breakdown(self) -> list[tuple[str, float, float]]:
+        """Return (name, ms, pct) for each compute phase in display order.
+
+        Known phases (forward, backward, optimizer, data) come first,
+        followed by any unexpected phases.
+        """
+        total = self.step_ms
+        ordered = [
+            (e.value, self.step_timings[e.value])
+            for e in _PHASE_ORDER
+            if e.value in self.step_timings
+        ]
+        known = {e.value for e in _PHASE_ORDER}
+        other = [(k, v) for k, v in self.step_timings.items() if k not in known]
+        return [
+            (name, ms, 100.0 * ms / total if total > 0 else 0.0) for name, ms in ordered + other
+        ]
+
+    def comm_breakdown(self) -> list[tuple[str, float]]:
+        """Return (display_name, ms) for each comm dimension in display order.
+
+        Returns empty list if no comm timings recorded.
+        """
+        items = [
+            (_COMM_DISPLAY.get(e.value, e.value), self.comm_timings[e.value])
+            for e in _COMM_ORDER
+            if e.value in self.comm_timings
+        ]
+        if EventType.COMMUNICATION.value in self.comm_timings:
+            items.append(
+                (
+                    EventType.COMMUNICATION.value,
+                    self.comm_timings[EventType.COMMUNICATION.value],
+                )
+            )
+        return items
+
+    @property
+    def comm_total_ms(self) -> float:
+        """Total communication volume across all dimensions."""
+        return sum(ms for _, ms in self.comm_breakdown())
+
+
+def _split_timings(timings: dict[str, float]) -> StepTimings:
+    """Separate raw timings dict into step vs comm."""
+    from nanigpt.profiling.event_types import COMM_EVENTS
+
+    step = {k: v for k, v in timings.items() if k != EventType.EVAL.value and k not in COMM_EVENTS}
+    comm = {k: v for k, v in timings.items() if k in COMM_EVENTS}
+    return StepTimings(step_timings=step, comm_timings=comm)
+
+
+def last_step_timings() -> StepTimings:
+    """Return structured timings from the most recent step."""
+    return _split_timings(get_global_metrics().last_step_ms())
+
+
+def mean_step_timings() -> StepTimings:
+    """Return structured timings averaged across all recorded steps."""
+    return _split_timings(get_global_metrics().mean_ms())
 
 
 _global_metrics: StepMetrics | None = None

@@ -128,9 +128,9 @@ def test_kernel_table_format_with_entries(caplog):
         _print_kernel_table([entry], top_n=5)
 
     log_text = caplog.text
-    assert "Kernel" in log_text
-    assert "GPU%" in log_text
     assert "aten::mm" in log_text
+    assert "ms" in log_text
+    assert "%" in log_text
 
 
 # ---- Window parsing tests ----

@@ -51,6 +51,7 @@ from nanigpt.distributed.comm import (
     enter_parallel_region,
     exit_parallel_region,
 )
+from nanigpt.distributed.mesh import get_process_group
 from nanigpt.distributed.plan import ParallelPlan
 from nanigpt.distributed.registry import ShardingPlan, resolve_sharding
 from nanigpt.distributed.sharding import Shard
@@ -189,7 +190,7 @@ def apply_sharding(
     tp_mesh = mesh["tp"]
     tp_rank = tp_mesh.get_local_rank()
     tp_size = tp_mesh.size()
-    group = tp_mesh.get_group()
+    group = get_process_group(mesh, "tp")
 
     module_dict = dict(model.named_modules())
 

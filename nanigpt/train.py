@@ -30,11 +30,12 @@ from nanigpt.distributed import (
     cleanup_distributed,
     init_distributed,
 )
+from nanigpt.env import enforce_defaults
 from nanigpt.models.dense_transformer import DenseTransformer
 from nanigpt.profiling import flop_counter
 from nanigpt.profiling.context import init_context, register_step_end, step_context
 from nanigpt.profiling.event_types import EventType
-from nanigpt.profiling.timer import get_global_metrics, measure
+from nanigpt.profiling.timer import last_step_timings, mean_step_timings, measure
 
 
 @torch.no_grad()
@@ -88,6 +89,8 @@ def train_worker(rank: int, world_size: int, config: TrainConfig) -> None:
         datefmt="%H:%M:%S",
     )
     log = logging.getLogger("train")
+
+    enforce_defaults()  # Populate env vars with defaults if unset
 
     if distributed:
         init_distributed(rank, world_size, backend=config.parallel.backend)
@@ -225,12 +228,10 @@ def train_worker(rank: int, world_size: int, config: TrainConfig) -> None:
             with measure(EventType.OPTIMIZER):
                 optimizer.step()
 
-        timings = get_global_metrics().last_step_ms()
-        train_timings = {k: v for k, v in timings.items() if k != EventType.EVAL.value}
-        total_ms = sum(train_timings.values())
-        tflops = flop_counter.achieved_tflops(step_flops, total_ms)
+        t = last_step_timings()
+        tflops = flop_counter.achieved_tflops(step_flops, t.step_ms)
         utilization = flop_counter.mfu(tflops, gpu_name)
-        tok_per_sec = tokens_per_step / (total_ms / 1000.0)
+        tok_per_sec = tokens_per_step / (t.step_ms / 1000.0)
 
         train_loss = loss.item()
         train_ppl = math.exp(train_loss)
@@ -238,11 +239,12 @@ def train_worker(rank: int, world_size: int, config: TrainConfig) -> None:
         log_dict = {
             "loss": train_loss,
             "perplexity": train_ppl,
-            "ms_per_step": total_ms,
+            "ms_per_step": t.step_ms,
             "tokens_per_sec": tok_per_sec,
             "tflops": tflops,
             "mfu": utilization,
-            **{f"time/{k}": v for k, v in train_timings.items()},
+            **{f"time/{k}": v for k, v in t.step_timings.items()},
+            **{f"comm/{k}": v for k, v in t.comm_timings.items()},
         }
 
         # ---- Validation ----
@@ -270,7 +272,7 @@ def train_worker(rank: int, world_size: int, config: TrainConfig) -> None:
             log.info(
                 f"step: {step:>{step_width}}/{config.training.num_steps}"
                 f" | loss: {train_loss:.2f}"
-                f" | ppl: {train_ppl:.4g} | ms/step: {total_ms:.1f}"
+                f" | ppl: {train_ppl:.4g} | ms/step: {t.step_ms:.1f}"
                 f" | tok/s: {tok_per_sec:,.0f}"
                 f" | TFLOPS: {tflops:.1f} | MFU: {utilization * 100:.1f}%"
             )
@@ -298,31 +300,43 @@ def train_worker(rank: int, world_size: int, config: TrainConfig) -> None:
     if is_main:
         wall_time = time.perf_counter() - t0
         peak_mem = torch.cuda.max_memory_allocated() / 1e9
-        all_mean_timings = get_global_metrics().mean_ms()
-        mean_timings = {k: v for k, v in all_mean_timings.items() if k != EventType.EVAL}
-        mean_total_ms = sum(mean_timings.values())
-        mean_tflops = flop_counter.achieved_tflops(step_flops, mean_total_ms)
+        mt = mean_step_timings()
+        mean_tflops = flop_counter.achieved_tflops(step_flops, mt.step_ms)
         mean_mfu = flop_counter.mfu(mean_tflops, gpu_name)
-        mean_tok_per_sec = tokens_per_step / (mean_total_ms / 1000.0) if mean_total_ms > 0 else 0.0
+        mean_tok_s = tokens_per_step / (mt.step_ms / 1000.0) if mt.step_ms > 0 else 0.0
 
-        log.info("--- Training complete ---")
-        log.info(f"Wall time: {wall_time:.1f}s ({config.training.num_steps} steps)")
-        log.info(f"Mean step: {mean_total_ms:.1f} ms ({tokens_per_step:,} tok/step)")
-        for name, ms in mean_timings.items():
-            pct = 100.0 * ms / mean_total_ms if mean_total_ms > 0 else 0.0
-            log.info(f"  {name:>12s}: {ms:7.2f} ms ({pct:5.1f}%)")
-        log.info(f"Mean tok/s: {mean_tok_per_sec:,.0f}")
-        log.info(f"Mean TFLOPS: {mean_tflops:.1f}")
-        log.info(f"Mean MFU: {mean_mfu * 100:.1f}%")
+        if mean_tok_s >= 1000:
+            tok_s_str = f"{mean_tok_s / 1000:.0f}k"
+        else:
+            tok_s_str = f"{mean_tok_s:.0f}"
+
+        log.info(f"--- Training complete ({config.training.num_steps} steps, {wall_time:.1f}s) ---")
+        log.info(f"MFU: {mean_mfu * 100:.1f}% ({mean_tflops:.1f} TFLOPS, {tok_s_str} tok/s)")
+        log.info("")
+        log.info(f"Step: {mt.step_ms:.1f} ms")
+
+        for name, ms, pct in mt.phase_breakdown():
+            log.info(f"  {name:<14s} {ms:6.1f} ms ({pct:.0f}%)")
+
+        comm_items = mt.comm_breakdown()
+        if comm_items:
+            log.info("")
+            log.info(f"Comm volume (overlapped with compute): {mt.comm_total_ms:.1f} ms")
+            for name, ms in comm_items:
+                log.info(f"  {name:<14s} {ms:6.1f} ms")
+
+        log.info("")
         log.info(f"Peak memory: {peak_mem:.2f} GB")
+
         if profiler is not None:
+            log.info("")
             profiler.print_summary()
             profiler.serve_perfetto()
 
         summary = {
             "wall_time_s": wall_time,
-            "mean_ms_per_step": mean_total_ms,
-            "mean_tokens_per_sec": mean_tok_per_sec,
+            "mean_ms_per_step": mt.step_ms,
+            "mean_tokens_per_sec": mean_tok_s,
             "mean_tflops": mean_tflops,
             "mean_mfu": mean_mfu,
             "peak_memory_gb": peak_mem,
